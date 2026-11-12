@@ -13,6 +13,8 @@ Every run has a unique idempotency key. Starting a workflow with a key that alre
 
 Prefix keys with the workflow or domain: a key already used by another workflow fails with `saga.ErrIdemKeyConflict`. Deduplication lasts as long as the run is kept (`Options.Retention`); after the purge the same key starts a new run.
 
+Which one to use in an HTTP API, a consumer or a worker, and how to split API and worker processes: [chapter 11](11-api-or-worker.md).
+
 ## Three ways to start
 
 ### `Workflow.Run`: inline

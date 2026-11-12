@@ -24,6 +24,7 @@ The reference documents stay short and precise; this guide explains how to use t
 8. [Testing](08-testing.md): integration tests, failure injection, crash and resume, determinism.
 9. [Production](09-production.md): configuration, sizing, shutdown, deploys, monitoring, retention.
 10. [Troubleshooting](10-troubleshooting.md): symptoms, causes, fixes, and SQL to inspect runs.
+11. [API layer or worker](11-api-or-worker.md): where runs execute, inline `Run` vs queued `Start`, the hybrid, splitting API and worker roles.
 
 The program of chapter 1 is in [examples/quickstart](../../examples/quickstart/main.go); a complete application with three isolated modules, an HTTP API and several instances is in [examples/modulith](../../examples/modulith).
 

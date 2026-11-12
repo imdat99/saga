@@ -59,6 +59,8 @@ for attempt := range 3 {
 
 `CancelRender` is an ordinary idempotent step calling `renderer.Cancel(ctx, string(ref))`. A late answer for a cancelled reference is stored against the old key and never read, so it is harmless.
 
+A runnable version of this pattern, combined with a human approval and a durable timer, is [examples/longrunning](../examples/longrunning/README.md).
+
 ## Payload size
 
 Signals, step outputs and compensation data are stored as JSON in `saga.signal` and `saga.step`. Keep them to IDs and small values; put large results (a rendered file) in storage and pass a URL.

@@ -13,6 +13,8 @@ Mỗi run có một idempotency key duy nhất. Khởi chạy workflow với key
 
 Thêm tiền tố workflow hoặc domain vào key: key đã được workflow khác dùng sẽ lỗi `saga.ErrIdemKeyConflict`. Khử trùng lặp kéo dài chừng nào run còn được giữ (`Options.Retention`); sau khi bị purge, cùng key sẽ tạo run mới.
 
+Nên dùng cách nào trong HTTP API, consumer hay worker, và cách tách process API với worker: [chương 11](11-api-hay-worker.md).
+
 ## Ba cách khởi chạy
 
 ### `Workflow.Run`: chạy inline

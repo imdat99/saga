@@ -24,6 +24,7 @@ Các tài liệu tham chiếu (tiếng Anh) giữ ngắn gọn và chính xác; 
 8. [Kiểm thử](08-kiem-thu.md): integration test, giả lập lỗi, crash và resume, tính tất định.
 9. [Triển khai production](09-production.md): cấu hình, định cỡ, shutdown, deploy, giám sát, retention.
 10. [Xử lý sự cố](10-xu-ly-su-co.md): triệu chứng, nguyên nhân, cách sửa, và SQL để kiểm tra run.
+11. [Tầng API hay worker](11-api-hay-worker.md): run thực thi ở đâu, `Run` inline hay `Start` qua hàng đợi, cách kết hợp, tách vai trò API và worker.
 
 Chương trình của chương 1 nằm ở [examples/quickstart](../../examples/quickstart/main.go); một ứng dụng đầy đủ với ba module tách biệt, HTTP API và nhiều instance nằm ở [examples/modulith](../../examples/modulith).
 

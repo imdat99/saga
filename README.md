@@ -68,6 +68,8 @@ func main() {
 - [Operations](docs/operations.md): lifecycle, pool sizing, PgBouncer, timing, event bus, retention.
 - [Patterns](docs/patterns.md): long-running external work, payload size.
 - [Quickstart](examples/quickstart/main.go): the two-step transfer of the guide's first chapter.
+- [Multi-workflow](examples/multiworkflow/README.md): a parent fanning out parallel child workflows, signals both ways, two-phase commit, cascading compensation.
+- [Long-running workflow](examples/longrunning/README.md): approval (`Await`/`Signal`), external callback (`SignalKey`), durable timer (`Sleep`), across processes and worker crashes.
 - [Example modulith](examples/modulith): three isolated modules, a checkout flow, HTTP API, multiple instances.
 
 ## Development

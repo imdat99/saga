@@ -96,6 +96,10 @@ err := saga.Lock(c, "account:"+in.AccountID, time.Minute,
 
 Locks are polled, not queued: no fairness and no deadlock detection. When a run needs several locks, take them in a fixed order (e.g. sorted keys).
 
+## A complete example
+
+[examples/longrunning](../../examples/longrunning/README.md) is a document publication saga that combines the three waits: a reviewer's approval (`Await` + `Signal`, with timeout), an external render job that calls back (`SignalKey` on the step key), and an embargo (`Sleep`). It runs across processes (`start` exits at once, a separate `worker` resumes the run, `approve` signals from another process), survives a worker killed mid-sleep, and compensates on rejection or timeout.
+
 ## Choosing a primitive
 
 | Need | Use |

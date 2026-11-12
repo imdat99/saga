@@ -126,6 +126,9 @@ Start: 69 allocs/op (`BenchmarkStepRun`). Breakdown per run: ~21 pgconn command 
 
 - [x] Bilingual user guide: `docs/guide` (English, primary) and `docs/huong-dan` (Vietnamese, same structure): getting started, steps, workflows, runs, waiting, modules (`idem`), event bus, testing, production, troubleshooting
 - [x] `examples/quickstart`: the guide's first program, built and linted with the repository, run against docker compose Postgres (done, compensated, same-key replay)
+- [x] `examples/longrunning`: approval with timeout (`Await`/`Signal`), external job calling back (`SignalKey` on the step key), embargo (`Sleep`), CLI across processes; verified against docker compose Postgres: approve, reject, approval timeout, worker SIGKILLed mid-sleep then finished by another worker
+- [x] `examples/multiworkflow`: parent order fanning out one child shipment per warehouse (child key = step key), signals both ways, two-phase commit, cascading compensation; verified against docker compose Postgres: all shipped, one warehouse out of stock, payment declined after all ready
+- [x] Guide chapter 11 (both languages): API layer or worker: where runs execute, inline `Run` vs `Start`, hybrid `Start` + bounded `Wait`, split API/worker roles, decision table (latencies measured: inline 3-step p50 ~9 ms, `Start`+`Wait` p50 ~27 ms, p90 ~69 ms on the fsync=off test database)
 - [ ] Keep both languages in sync on every API change (rule recorded in the decision log)
 
 ## Known limitations (current)

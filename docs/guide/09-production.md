@@ -26,6 +26,8 @@ eng, err := saga.New(pool, saga.Options{
 
 `AsyncStepStart: true` saves about one fsync per step (one durable commit instead of two) at a precise risk: in a Postgres crash, the record that a step had started can be lost; see its documentation and [benchmarks](../benchmarks.md) before enabling.
 
+Whether every instance serves the API and executes runs, or the roles are split: [chapter 11](11-api-or-worker.md#deployment-topologies).
+
 ## Startup and shutdown
 
 ```go

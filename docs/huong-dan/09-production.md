@@ -26,6 +26,8 @@ eng, err := saga.New(pool, saga.Options{
 
 `AsyncStepStart: true` tiết kiệm khoảng một lần fsync mỗi step (một commit bền vững thay vì hai), đổi lại một rủi ro cụ thể: khi Postgres crash, bản ghi "step đã bắt đầu" có thể mất. Đọc tài liệu của option này và [benchmarks](../benchmarks.md) trước khi bật.
 
+Mọi instance vừa phục vụ API vừa thực thi run, hay tách vai trò: [chương 11](11-api-hay-worker.md#mô-hình-triển-khai).
+
 ## Khởi động và tắt
 
 ```go

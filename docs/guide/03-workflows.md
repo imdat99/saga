@@ -113,3 +113,5 @@ Each costs one recorded pseudo-step.
 ## Nested runs
 
 A step may start another workflow (`Child.Run(ctx, eng, key, in)` with the step's `ctx`). The child is an independent run with its own key and history; it does not inherit the parent's run id. Derive its key from the parent's step key (e.g. `string(k) + ":child"`) so a re-executed parent step joins the same child run.
+
+For children that run in parallel and report back (fan-out/fan-in with signals, two-phase commit, cascading compensation), see [examples/multiworkflow](../../examples/multiworkflow/README.md).

@@ -113,3 +113,5 @@ Mỗi lệnh tốn một pseudo-step được ghi.
 ## Run lồng nhau
 
 Một step có thể khởi chạy workflow khác (`Child.Run(ctx, eng, key, in)` với `ctx` của step). Run con là run độc lập với key và lịch sử riêng; nó không kế thừa run id của run cha. Hãy tạo key của nó từ key của step cha (ví dụ `string(k) + ":child"`) để khi step cha chạy lại thì gặp lại đúng run con đó.
+
+Với các run con chạy song song và báo lại cho cha (fan-out/fan-in bằng signal, commit hai pha, compensation lan truyền), xem [examples/multiworkflow](../../examples/multiworkflow/README.md#ví-dụ-nhiều-workflow).

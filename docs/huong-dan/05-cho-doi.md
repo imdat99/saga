@@ -96,6 +96,10 @@ err := saga.Lock(c, "account:"+in.AccountID, time.Minute,
 
 Lock được poll, không xếp hàng: không công bằng và không phát hiện deadlock. Khi một run cần nhiều lock, hãy lấy theo thứ tự cố định (ví dụ key đã sắp xếp).
 
+## Ví dụ hoàn chỉnh
+
+[examples/longrunning](../../examples/longrunning/README.md#ví-dụ-workflow-chạy-dài) là một saga xuất bản tài liệu kết hợp cả ba kiểu chờ: chờ người duyệt (`Await` + `Signal`, có timeout), chờ job render bên ngoài gọi lại (`SignalKey` trên key của step), và chờ trước khi công bố (`Sleep`). Nó chạy qua nhiều process (`start` thoát ngay, một `worker` riêng tiếp tục run, `approve` gửi signal từ process khác), vẫn hoàn tất khi worker bị kill giữa lúc sleep, và compensate khi bị từ chối hoặc hết hạn.
+
 ## Chọn công cụ
 
 | Nhu cầu | Dùng |
