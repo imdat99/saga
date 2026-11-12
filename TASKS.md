@@ -131,6 +131,13 @@ Start: 69 allocs/op (`BenchmarkStepRun`). Breakdown per run: ~21 pgconn command 
 - [x] Guide chapter 11 (both languages): API layer or worker: where runs execute, inline `Run` vs `Start`, hybrid `Start` + bounded `Wait`, split API/worker roles, decision table (latencies measured: inline 3-step p50 ~9 ms, `Start`+`Wait` p50 ~27 ms, p90 ~69 ms on the fsync=off test database)
 - [ ] Keep both languages in sync on every API change (rule recorded in the decision log)
 
+## CI and releases
+
+- [x] `ci.yml` (pull requests, and called by `release.yml`): lint + release script tests, `-race` tests, chaos tests, performance budget (`internal/tools/benchgate` against `.github/perf-budget.txt`, medians of 5 runs, report in the job summary, `bench.txt` artifact)
+- [x] `release.yml` (push to `main`): the whole CI gate, then the next semver tag from Conventional Commits (`.github/scripts/next-version.sh`, tested by `next-version_test.sh`), GitHub release with generated notes, Go proxy notified; serialized with a concurrency group
+- [x] Validated locally: actionlint clean, benchgate unit tests, version script tests (9 cases), budget passes on the CI benchmark command (StepRun 40 allocs/op, 3.4 KiB/op, p95 2.4 ms; 3 instances 56 allocs/op, 204 runs/s)
+- [ ] First run on GitHub (needs the push): check the runner's p95 and the three-instance allocations against the budget, adjust with a reason if the hosted runner differs
+
 ## Known limitations (current)
 
 - Recovery needs at least one instance with `Engine.Start`; inline-only deployments resume abandoned runs only when called again with the same `idem_key`.

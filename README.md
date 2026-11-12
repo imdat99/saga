@@ -72,6 +72,24 @@ func main() {
 - [Long-running workflow](examples/longrunning/README.md): approval (`Await`/`Signal`), external callback (`SignalKey`), durable timer (`Sleep`), across processes and worker crashes.
 - [Example modulith](examples/modulith): three isolated modules, a checkout flow, HTTP API, multiple instances.
 
+## Install
+
+```bash
+go get github.com/imdat99/saga@latest   # or a specific release: @v0.1.0
+```
+
+Releases are tagged automatically (see below); the list is on the repository's Releases page.
+
+## Releases
+
+Every merge to `main` runs the release workflow (`.github/workflows/release.yml`):
+
+1. The full CI gate (`.github/workflows/ci.yml`): lint, unit and integration tests with `-race`, chaos tests, and the **performance budget**: benchmarks (median of 5 runs) checked against [`.github/perf-budget.txt`](.github/perf-budget.txt) by `internal/tools/benchgate` (allocations per run, bytes per run, p95 step overhead, throughput floor).
+2. If every job passes, the next version is computed from the commit messages since the last tag ([Conventional Commits](https://www.conventionalcommits.org/)): `feat:` bumps the minor version, `fix:` and anything else the patch, `type!:` or `BREAKING CHANGE:` the major (the minor while below v1.0.0).
+3. The tag is pushed, a GitHub release with generated notes is created, and the Go module proxy is told about the version.
+
+Nothing is tagged when a job fails. Pull requests run the same CI gate; protect `main` by requiring the `ci` checks. To change a performance limit, edit the budget file in the PR with the reason (and update `docs/benchmarks.md`).
+
 ## Development
 
 ```bash

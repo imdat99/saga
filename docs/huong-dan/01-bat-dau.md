@@ -7,7 +7,7 @@
 - Redis 7, chỉ khi dùng event bus (chương 7).
 
 ```bash
-go get github.com/imdat99/saga
+go get github.com/imdat99/saga@latest   # các bản release có tag: vX.Y.Z
 make up   # trong repository này: Postgres 16 và Redis 7 từ docker-compose.yml
 ```
 

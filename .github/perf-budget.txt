@@ -1,0 +1,20 @@
+# Performance budget checked by CI (internal/tools/benchgate) on the median of
+# `-count 5` runs, with SAGA_BENCH_ASYNC_COMMIT=1 (commit cost excluded: this
+# gates the engine, not the runner's disk) and SAGA_BENCH_MAX_CONNS=12 (no pool
+# queueing, see docs/benchmarks.md).
+#
+# Allocations are nearly deterministic: tight limits, about 10% above the
+# measured values for the single-run benchmark (M8: 40 allocs/op, 3.3 KiB/op).
+# The three-instance count varies with goroutine interleaving (measured 47-56):
+# its limit has more room.
+# Latency and throughput depend on the runner: the p95 limit is the plan's
+# engine-overhead target, runs/s is a floor that only catches collapses.
+#
+# Raise a limit only with a reason in the PR (and docs/benchmarks.md).
+
+# benchmark                     unit          op   limit
+BenchmarkStepRun                allocs/op     <=   45
+BenchmarkStepRun                B/op          <=   4096
+BenchmarkStepRun                p95-ms/step   <=   5
+BenchmarkRunsThreeInstances     allocs/op     <=   70
+BenchmarkRunsThreeInstances     runs/s        >=   50

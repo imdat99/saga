@@ -1,9 +1,10 @@
 name: ci
 
+# Pull requests run the full gate. The release workflow calls this one on
+# every push to main and tags a version only if every job here passed.
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -19,15 +20,43 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.15.0
+      - name: Release script tests
+        run: bash .github/scripts/next-version_test.sh
 
   test:
     runs-on: ubuntu-latest
-    # Integration tests start Postgres 16 (and Redis 7 from M5) with
-    # testcontainers; the hosted runner has Docker.
+    # Integration tests start Postgres 16 and Redis 7 with testcontainers;
+    # the hosted runner has Docker.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test -race -count=1 ./...
-      - run: go test -race -count=1 -tags chaos ./test/chaos/...
+      - name: Unit and integration tests
+        run: go test -race -count=1 ./...
+      - name: Chaos tests
+        run: go test -race -count=1 -tags chaos ./test/chaos/...
+
+  perf:
+    runs-on: ubuntu-latest
+    # Benchmarks against the testcontainers Postgres, checked against
+    # .github/perf-budget.txt (medians of 5 runs). Commit cost is excluded
+    # (SAGA_BENCH_ASYNC_COMMIT): the gate measures the engine, not the disk.
+    env:
+      SAGA_BENCH_ASYNC_COMMIT: "1"
+      SAGA_BENCH_MAX_CONNS: "12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Benchmarks
+        shell: bash # -o pipefail: a failing benchmark must fail the step despite tee
+        run: go test -run '^$' -bench . -benchtime 500x -count 5 . | tee bench.txt
+      - name: Performance budget
+        run: go run ./internal/tools/benchgate -budget .github/perf-budget.txt -summary "$GITHUB_STEP_SUMMARY" bench.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ github.sha }}
+          path: bench.txt

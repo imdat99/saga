@@ -7,7 +7,7 @@
 - Redis 7 only if you use the event bus (chapter 7).
 
 ```bash
-go get github.com/imdat99/saga
+go get github.com/imdat99/saga@latest   # tagged releases: vX.Y.Z
 make up   # in this repository: Postgres 16 and Redis 7 from docker-compose.yml
 ```
 
