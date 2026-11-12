@@ -352,9 +352,10 @@ func blockRun(t *testing.T, pool *pgxpool.Pool, runID string) func() {
 	return func() { _ = tx.Rollback(ctx) }
 }
 
-// The per-execution Interrupt stops a statement in flight when the watched
-// context is cancelled, refuses new statements afterwards, and leaves the pool
-// usable; a narrower context (own deadline) keeps pgconn's watch.
+// The per-execution Interrupt stops a statement in flight when it fires,
+// refuses new statements afterwards (or once a covered context is done, even
+// without Fire), and leaves the pool usable; a narrower context (own
+// deadline) keeps pgconn's watch.
 func TestInterrupt(t *testing.T) {
 	base := testdb.New(t)
 	ctx := context.Background()
@@ -363,10 +364,12 @@ func TestInterrupt(t *testing.T) {
 	}
 	pool := poolWithMode(t, base, pgx.QueryExecModeCacheStatement, 1)
 	st := store.New(pool)
-	if st.NewInterrupt(ctx) != nil {
-		t.Fatal("interrupt for a context that cannot be cancelled")
+	var none *store.Interrupt // nil-safe
+	none.Cover(ctx)
+	none.Fire()
+	if none.Covers() {
+		t.Fatal("nil interrupt covers")
 	}
-	(*store.Interrupt)(nil).Stop() // nil-safe
 
 	const runID = "00000000-0000-0000-0000-0000000000ee"
 	if ok, _, err := st.InsertRun(ctx, store.Run{ID: runID, Workflow: "w", Version: 1, IdemKey: "k", Input: []byte(`{}`)},
@@ -376,7 +379,8 @@ func TestInterrupt(t *testing.T) {
 
 	// Narrower context: its own deadline still applies (pgconn's watch).
 	runCtx, cancelRun := context.WithCancel(ctx)
-	in := st.NewInterrupt(runCtx)
+	in := &store.Interrupt{}
+	in.Cover(runCtx)
 	l := store.Lease{RunID: runID, Owner: "me", Version: 1, Interrupt: in}
 	unblock := blockRun(t, base, runID)
 	short, cancelShort := context.WithTimeout(runCtx, 150*time.Millisecond)
@@ -390,9 +394,23 @@ func TestInterrupt(t *testing.T) {
 		t.Fatalf("watched statement after the narrow timeout: %v", err)
 	}
 
-	// Watched context cancelled while the statement waits.
+	// A covered context cancelled without Fire (a path that forgot it):
+	// no statement starts.
+	gone, cancelGone := context.WithCancel(ctx)
+	inGone := &store.Interrupt{}
+	inGone.Cover(gone)
+	cancelGone()
+	lGone := store.Lease{RunID: runID, Owner: "me", Version: 1, Interrupt: inGone}
+	if _, _, err := st.StartStepFenced(gone, lGone, 9, "s", false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("statement under a done context: %v", err)
+	}
+
+	// Execution cancelled (context, then Fire) while the statement waits.
 	unblock = blockRun(t, base, runID)
-	time.AfterFunc(150*time.Millisecond, cancelRun)
+	time.AfterFunc(150*time.Millisecond, func() {
+		cancelRun()
+		in.Fire()
+	})
 	start := time.Now()
 	_, _, err = st.StartStepFenced(runCtx, l, 3, "s", false)
 	unblock()
@@ -406,7 +424,6 @@ func TestInterrupt(t *testing.T) {
 	if err := st.FinishStepFenced(runCtx, l, 2, "s", store.Outcome{Status: store.StepDone}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("statement after cancellation: %v", err)
 	}
-	in.Stop()
 
 	// The pool (one connection) is still usable, with no stale deadline.
 	l2 := store.Lease{RunID: runID, Owner: "me", Version: 1}

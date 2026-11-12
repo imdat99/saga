@@ -308,12 +308,8 @@ func (e *Engine) run(ctx context.Context, req runRequest) (json.RawMessage, erro
 	}
 	defer e.leave()
 
-	id, err := uuid.NewV7()
-	if err != nil {
-		return nil, err
-	}
 	run := store.Run{
-		ID: id.String(), Workflow: name, Version: version,
+		ID: newRunID(), Workflow: name, Version: version,
 		IdemKey: idemKey, Status: store.RunRunning, Input: input,
 	}
 
@@ -401,7 +397,10 @@ func (e *Engine) execute(ctx context.Context, run store.Run, acquired time.Time,
 	// A run started from inside another run's step must not look like part
 	// of it to its own compensators and hooks (RunIDFrom): hide the parent.
 	ctx = context.WithValue(ctx, runCtxKey{}, (*runCtx)(nil))
-	ctx, untrack := e.hb.track(ctx, run.ID, run.LeaseVersion, acquired)
+	ctx, tracked := e.hb.track(ctx, run.ID, run.LeaseVersion, acquired)
+	// The heartbeat entry stops the checkpoint statement in flight when ctx
+	// is cancelled, in place of pgconn's per-statement watch.
+	lease.Interrupt = tracked.interrupter()
 	defer func() {
 		if errors.Is(context.Cause(ctx), ErrShutdown) {
 			// Hand the run over now instead of after the TTL.
@@ -411,13 +410,8 @@ func (e *Engine) execute(ctx context.Context, run store.Run, acquired time.Time,
 			}
 			cancel()
 		}
-		untrack()
+		e.hb.untrack(run.ID, tracked)
 	}()
-	// One context watch for all checkpoints of this execution. Deferred
-	// after untrack so it is stopped first: untrack cancels ctx, which would
-	// otherwise run the watch's callback in a new goroutine.
-	lease.Interrupt = e.st.NewInterrupt(ctx)
-	defer lease.Interrupt.Stop()
 
 	var history []store.Step // empty for a fresh run
 	if !fresh {
@@ -437,7 +431,8 @@ func (e *Engine) execute(ctx context.Context, run store.Run, acquired time.Time,
 	}
 
 	rc := &runCtx{Context: ctx, eng: e, run: run, lease: lease}
-	if len(history) > 0 { // a nil map reads as empty: nothing to allocate for a new run
+	lease.Interrupt.Cover(rc) // rc is cancelled exactly with ctx
+	if len(history) > 0 {     // a nil map reads as empty: nothing to allocate for a new run
 		rc.steps = make(map[int]store.Step, len(history))
 		for _, st := range history {
 			rc.steps[st.Seq] = st

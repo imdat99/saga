@@ -128,53 +128,57 @@ func (p *params) bool(b bool) {
 	p.vals = append(p.vals, textFalse)
 }
 
-// Interrupt watches the context of one run execution for all of its
-// fast-path statements, in place of pgconn's per-statement watch.
+// Interrupt stops the fast-path statement in flight of one run execution
+// when the execution is cancelled, in place of pgconn's per-statement watch.
 //
 // Why: pgconn watches a cancellable context with context.AfterFunc on every
-// statement (4 allocations each; a run context is always cancellable), about
-// half of what remained per step. An Interrupt registers one AfterFunc per
-// execution; statements run with a context that has no Done channel, and on
-// cancellation the Interrupt sets a past deadline on the connection of the
-// statement in flight. That is what pgconn's default handler
-// (DeadlineContextWatcherHandler) does: the read fails and pgconn closes the
-// connection. A user-configured pgconn BuildContextWatcherHandler (such as
-// the cancel-request handler) is bypassed for these statements: a cancelled
-// run always closes the connection of its statement in flight.
+// statement (4 allocations each; a run context is always cancellable). An
+// Interrupt is a plain value embedded in the caller's per-execution state
+// (the heartbeat entry of the run): no allocation of its own, no watch of its
+// own. Whoever cancels a covered context must call Fire right after: the
+// heartbeat does when a lease is lost or on shutdown, and an AfterFunc on the
+// caller's context does when that one is cancelled. Fire sets a past deadline
+// on the connection of the statement in flight, which is what pgconn's
+// default handler (DeadlineContextWatcherHandler) does: the read fails and
+// pgconn closes the connection. A user-configured pgconn
+// BuildContextWatcherHandler (such as the cancel-request handler) is bypassed
+// for these statements. Covered statements run with context.Background(), so
+// pgconn does not watch them; begin also refuses to start one once the
+// covered context is done, should a cancellation path forget to Fire.
 //
-// The statements of one execution are sequential (one goroutine), so one
-// connection at a time is tracked; begin/end and fire are serialised by mu.
+// The statements of one execution are sequential (one goroutine): one
+// connection at a time is tracked; begin/end and Fire are serialised by mu.
+// Cover is called by that goroutine only, before its statements.
 type Interrupt struct {
-	done     <-chan struct{}
-	detached context.Context //nolint:containedctx // ctx without cancellation, for pgconn
-	stop     func() bool
+	covered [2]context.Context // statements under these contexts rely on Fire
 
 	mu    sync.Mutex
 	conn  net.Conn // connection of the statement in flight, nil between statements
 	fired bool
 }
 
-// NewInterrupt returns an Interrupt for an execution running under ctx, or
-// nil when the fast path is off or ctx cannot be cancelled. Call Stop when
-// the execution ends.
-func (s *Store) NewInterrupt(ctx context.Context) *Interrupt {
-	done := ctx.Done()
-	if !s.fast || done == nil {
-		return nil
+// Cover makes statements issued under ctx (compared by identity) rely on in
+// rather than on pgconn's watch. ctx must be cancelled only by a path that
+// calls Fire. At most two contexts; further calls are ignored (their
+// statements keep pgconn's watch).
+func (in *Interrupt) Cover(ctx context.Context) {
+	if in == nil {
+		return
 	}
-	in := &Interrupt{done: done, detached: context.WithoutCancel(ctx)}
-	in.stop = context.AfterFunc(ctx, in.fire)
-	return in
-}
-
-// Stop releases the watch. Safe on nil.
-func (in *Interrupt) Stop() {
-	if in != nil {
-		in.stop()
+	switch {
+	case in.covered[0] == nil:
+		in.covered[0] = ctx //nolint:fatcontext // stored for identity comparison, not wrapped
+	case in.covered[1] == nil:
+		in.covered[1] = ctx
 	}
 }
 
-func (in *Interrupt) fire() {
+// Fire interrupts the statement in flight, if any, and every later one.
+// Safe on nil and from any goroutine.
+func (in *Interrupt) Fire() {
+	if in == nil {
+		return
+	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	in.fired = true
@@ -183,25 +187,29 @@ func (in *Interrupt) fire() {
 	}
 }
 
-// covers reports whether a statement under ctx may rely on in: ctx must be
-// cancelled exactly when the watched context is (same Done channel), so a
-// caller passing a narrower context keeps pgconn's own watch.
+// Covers reports whether in covers any context.
+func (in *Interrupt) Covers() bool { return in != nil && in.covered[0] != nil }
+
+// covers reports whether a statement under ctx may rely on in. Contexts
+// are pointers in practice, so the comparison cannot panic.
 func (in *Interrupt) covers(ctx context.Context) bool {
-	return in != nil && ctx.Done() == in.done
+	return in != nil && ctx != nil && (ctx == in.covered[0] || ctx == in.covered[1])
 }
 
-// begin tracks conn for a statement; false if the context is already done.
-func (in *Interrupt) begin(conn net.Conn) bool {
+// begin tracks conn for a statement under ctx; false if the execution was
+// interrupted or ctx is already done.
+func (in *Interrupt) begin(ctx context.Context, conn net.Conn) bool {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	if in.fired {
+	if in.fired || ctx.Err() != nil {
 		return false
 	}
 	in.conn = conn
 	return true
 }
 
-// end stops tracking and reports whether the context fired meanwhile.
+// end stops tracking and reports whether the execution was interrupted
+// meanwhile.
 func (in *Interrupt) end() bool {
 	in.mu.Lock()
 	defer in.mu.Unlock()
@@ -209,12 +217,18 @@ func (in *Interrupt) end() bool {
 	return in.fired
 }
 
-// interrupted is the error of a statement stopped by its context.
+// interrupted is the error of a statement stopped by its context. Fire may
+// run just before the context reports done (the caller's cancellation
+// reaches it through an AfterFunc): context.Canceled stands in meanwhile.
 func interrupted(ctx context.Context, err error) error {
-	if err == nil {
-		return ctx.Err()
+	cause := ctx.Err()
+	if cause == nil {
+		cause = context.Canceled
 	}
-	return fmt.Errorf("%w: %w", ctx.Err(), err)
+	if err == nil {
+		return cause
+	}
+	return fmt.Errorf("%w: %w", cause, err)
 }
 
 // query runs st with p on a pooled connection, calling row for each result
@@ -228,17 +242,19 @@ func (s *Store) query(ctx context.Context, in *Interrupt, st *fastStmt, p *param
 	}
 	defer c.Release()
 	pc := c.Conn().PgConn()
-	qctx := ctx
-	watched := in.covers(ctx)
-	if watched {
-		if !in.begin(pc.Conn()) {
-			return 0, interrupted(ctx, nil)
-		}
-		qctx = in.detached
+	if !in.covers(ctx) {
+		return s.exec(ctx, c.Conn(), st, p, row)
 	}
-	n, err := s.exec(qctx, c.Conn(), st, p, row)
-	if watched && in.end() {
-		// Cancelled during the statement: the deadline set by fire must not
+	if !in.begin(ctx, pc.Conn()) {
+		return 0, interrupted(ctx, nil)
+	}
+	// Also deferred (end is idempotent), so that a panic in a row callback
+	// cannot leave the pooled connection tracked, where a late Fire would
+	// hit another user's statement. Runs before Release.
+	defer in.end()
+	n, err := s.exec(context.Background(), c.Conn(), st, p, row) // no watch: in stands in for it
+	if in.end() {
+		// Cancelled during the statement: the deadline set by Fire must not
 		// follow the connection back to the pool (pgconn resets it the
 		// same way after its own watch fired). If the statement completed
 		// anyway, its result stands, as with pgconn.

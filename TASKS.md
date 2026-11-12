@@ -16,6 +16,7 @@ Legend: `[x]` done, `[~]` in progress, `[ ]` todo. Update this file in the same 
 | M5 | Event bus: staging, outbox, relay to BullMQ | Done |
 | M6 | Example modulith, e2e, benchmarks, observability | Done |
 | M7 | GC and allocation diet of the hot path | Done |
+| M8 | Allocation diet, second pass | Done |
 
 ## M0 - Skeleton
 
@@ -111,6 +112,15 @@ Baseline (`BenchmarkStepRun`, one run = 10 no-op steps, `SAGA_BENCH_ASYNC_COMMIT
 - [x] Round 3 - one context watch per execution (`store.Interrupt`) instead of pgconn's per statement, step results encoded into a per-run buffer (`json/v2.MarshalWrite` with v1 options, byte-identical), benchmark refresh in `docs/benchmarks.md`, decision log. Result: 156 -> 69 allocs/op, 9.1 -> 3.7 KB/op. Review 3: PASS (nits fixed: no deadline reset on a closed connection, bookkeeping test). Overall (benchstat, n=6): 500 -> 69 allocs/op (-86%), 25.6 -> 3.6 KiB/op, -11.5% ns/op, 3 instances +8% runs/s (`docs/benchmarks.md`)
 - Floor left (~69/run, documented): one command tag per statement inside pgconn (~21), the step `Key` string (10), `reflect.New` in json for value outputs (~8, passing pointers would change which `MarshalJSON` methods run), per-execution context/heartbeat/lease setup (~12)
 - [x] Verified: `go test -race -count=10 . ./internal/store`, full suite, chaos tests and `golangci-lint` green; each round reviewed by a subagent (3 rounds, all PASS on the first review)
+
+## M8 - Allocation diet, second pass
+
+Start: 69 allocs/op (`BenchmarkStepRun`). Breakdown per run: ~21 pgconn command tags (one per statement, not addressable without forking pgx), 10 step keys, ~14 per-execution setup (of which 8 for the lease's context watch), ~5 `reflect.New` in json for value outputs, 2 uuid, the rest workflow I/O and benchmark noise. Merging checkpoints (done of step N with start of N+1) was proposed and not chosen (changes the per-step checkpoint invariant).
+
+- [x] Round 4 - step keys carved from a per-execution append-only arena (`unsafe.String` over bytes never written again; 512 B chunks bound what a retained key pins). 69 -> 61. Review: PASS (doc on `Key` about retention, edge-case and GC tests added)
+- [x] Round 5 - context watch folded into the heartbeat entry: fired by the heartbeat's own cancellations and, only when the caller's context can be cancelled, by an AfterFunc on it; statements run on `context.Background()`; covered contexts matched by identity. 61 -> 52. Review: PASS (caller's cause set before Fire, AfterFunc registered outside the heartbeat lock, `end` deferred; tests for caller cancel, caller cause, shutdown and lease loss mid-statement, mutation-checked)
+- [x] Round 6 - encode through a pointer when the type provably encodes the same (no pointer-receiver marshal method on the value or on anything reached through struct fields and arrays), uuid v7 without the reader allocation. 52 -> 40. Review: PASS (byte equality checked against the json/v2 source; extra cases tested: pointer root, omitzero with pointer `IsZero`, pointer `MarshalText` map keys)
+- [x] Verified: benchmarks (interleaved benchstat vs M7: 69 -> 40 allocs/op, -8.5% B/op, latency unchanged), full suite, `-count=10 . ./internal/store`, chaos, lint; one review per round focused on invariants (3 rounds, all PASS on the first review)
 
 ## Known limitations (current)
 

@@ -131,14 +131,21 @@ func TestFastPathEnabled(t *testing.T) {
 	}
 }
 
-// Interrupt bookkeeping: fire sets a past deadline only on the connection of
+// Interrupt bookkeeping: Fire sets a past deadline only on the connection of
 // the statement in flight, and no statement starts after it fired.
 func TestInterruptBookkeeping(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	in := (&Store{fast: true}).NewInterrupt(ctx)
-	defer in.Stop()
-	if !in.covers(ctx) || in.covers(context.Background()) {
+	other, cancelOther := context.WithCancel(context.Background())
+	defer cancelOther()
+	in := &Interrupt{}
+	if in.Covers() || in.covers(ctx) {
+		t.Fatal("empty interrupt covers")
+	}
+	in.Cover(ctx)
+	in.Cover(other)
+	in.Cover(context.TODO()) // third one ignored
+	if !in.covers(ctx) || !in.covers(other) || in.covers(context.TODO()) || in.covers(context.Background()) {
 		t.Fatal("covers: wrong context match")
 	}
 	narrow, cancelNarrow := context.WithTimeout(ctx, time.Hour)
@@ -155,13 +162,13 @@ func TestInterruptBookkeeping(t *testing.T) {
 	defer busyPeer.Close()
 
 	// A statement that ended before the cancellation is not touched.
-	if !in.begin(idle) || in.end() {
+	if !in.begin(ctx, idle) || in.end() {
 		t.Fatal("begin/end before cancellation")
 	}
-	if !in.begin(busy) {
+	if !in.begin(ctx, busy) {
 		t.Fatal("begin refused before cancellation")
 	}
-	cancel()
+	go func() { cancel(); in.Fire() }()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		in.mu.Lock()
@@ -175,7 +182,7 @@ func TestInterruptBookkeeping(t *testing.T) {
 	if !in.end() {
 		t.Fatal("end did not report the cancellation")
 	}
-	if in.begin(idle) {
+	if in.begin(other, idle) {
 		t.Fatal("begin accepted after cancellation")
 	}
 	// fire set a past deadline on busy, never on idle.

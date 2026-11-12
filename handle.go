@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/imdat99/saga/internal/store"
@@ -89,15 +88,11 @@ func decodeOutput[O any](workflow string, raw json.RawMessage) (O, error) {
 // any started engine (this one included) instead of running it inline. With
 // an idempotency key already in use it returns a handle to the existing run.
 func (w *Workflow[I, O]) Start(ctx context.Context, e *Engine, idemKey string, in I) (*Handle[O], error) {
-	raw, err := json.Marshal(in)
+	raw, err := w.inJSON.marshal(in)
 	if err != nil {
 		return nil, fmt.Errorf("encode input of %s: %w", w.name, err)
 	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return nil, err
-	}
-	run := store.Run{ID: id.String(), Workflow: w.name, Version: w.version, IdemKey: idemKey, Input: raw}
+	run := store.Run{ID: newRunID(), Workflow: w.name, Version: w.version, IdemKey: idemKey, Input: raw}
 
 	inserted := false
 	err = pgx.BeginFunc(ctx, e.pool, func(tx pgx.Tx) error {

@@ -28,6 +28,10 @@ type Step[I, O, C any] struct {
 	// hasComp: compensation data is only encoded and stored for steps
 	// that have a compensator to read it.
 	hasComp bool
+	// outJSON and compJSON encode outputs and compensation data without
+	// allocating when the types allow it (see jsonSlot).
+	outJSON  *jsonSlot[O]
+	compJSON *jsonSlot[C]
 }
 
 // DefineStep registers a step. Call it at package level: names must be unique
@@ -57,7 +61,10 @@ func defineStep[I, O, C any](
 	for _, o := range opts {
 		o(&cfg)
 	}
-	s := &Step[I, O, C]{name: name, invoke: invoke, cfg: cfg, hasComp: compensate != nil}
+	s := &Step[I, O, C]{
+		name: name, invoke: invoke, cfg: cfg, hasComp: compensate != nil,
+		outJSON: newJSONSlot[O](), compJSON: newJSONSlot[C](),
+	}
 	var comp compensator
 	if compensate != nil {
 		comp = func(ctx context.Context, k Key, raw json.RawMessage) error {
@@ -95,7 +102,7 @@ func (s *Step[I, O, C]) Run(c Ctx, in I) (O, error) {
 	}
 
 	seq := rc.nextSeq()
-	key := stepKey(rc.run.ID, seq, s.name)
+	key := rc.keys.key(rc.run.ID, seq, s.name)
 
 	// A step replayed as "started" was interrupted with an unknown outcome:
 	// whatever happens now, it must be compensated as uncertain. Known from
@@ -150,13 +157,13 @@ func (s *Step[I, O, C]) Run(c Ctx, in I) (O, error) {
 	// Encoded into the run's scratch buffer: both slices are only read
 	// until FinishStepFenced has sent them.
 	rc.jbuf.Reset()
-	outRaw, err := rc.appendJSON(out)
+	outRaw, err := appendJSON(rc, s.outJSON, out)
 	if err != nil {
 		return zero, rc.setFatal(fmt.Errorf("encode output of %s: %w", s.name, err))
 	}
 	var compRaw json.RawMessage
 	if s.hasComp {
-		if compRaw, err = rc.appendJSON(comp); err != nil {
+		if compRaw, err = appendJSON(rc, s.compJSON, comp); err != nil {
 			return zero, rc.setFatal(fmt.Errorf("encode compensation data of %s: %w", s.name, err))
 		}
 	}
