@@ -85,9 +85,16 @@ func (b *bus) producer() *eventbus.Producer {
 // consumer returns a consumer of group with fast retries.
 func (b *bus) consumer(group string, subs ...eventbus.Subscriber) *eventbus.Consumer {
 	b.t.Helper()
-	c, err := eventbus.NewConsumer(group, eventbus.ConsumerOptions{
+	return b.consumerWith(group, func(*eventbus.ConsumerOptions) {}, subs...)
+}
+
+func (b *bus) consumerWith(group string, set func(*eventbus.ConsumerOptions), subs ...eventbus.Subscriber) *eventbus.Consumer {
+	b.t.Helper()
+	opts := eventbus.ConsumerOptions{
 		Redis: b.redis, Prefix: b.prefix, Backoff: 20 * time.Millisecond, Logger: b.logger(),
-	})
+	}
+	set(&opts)
+	c, err := eventbus.NewConsumer(group, opts)
 	if err != nil {
 		b.t.Fatal(err)
 	}
@@ -210,23 +217,60 @@ func TestSubscriberInAnotherService(t *testing.T) {
 	expectOnce(t, rec, []string{"audit", "invoice"}, ids)
 }
 
-// A group that registers after the relays started is picked up (registry
-// version), and gets the events relayed from then on.
-func TestLateConsumerGroupIsRouted(t *testing.T) {
+// Before any group ever registered (first deploy), events are held, not
+// dropped; once a group registered, the routing applies: an event no group
+// handles is marked sent to nobody.
+func TestEventsHeldUntilFirstRegistration(t *testing.T) {
 	t.Parallel()
 	b := newTestBus(t)
 	p := b.producer()
 	start(t, p)
-	emit(t, b, p, 2) // no group yet: relayed to nobody
-	waitFor(t, "first batch relayed", func() bool { return unsent(t, b.pool) == 0 })
+	early := emit(t, b, p, 2)
+	time.Sleep(300 * time.Millisecond) // several relay passes
+	if n := unsent(t, b.pool); n != 2 {
+		t.Fatalf("unsent = %d before any registration, want 2 (held)", n)
+	}
 
 	rec := newRecorder()
 	start(t, b.consumer("late", eventbus.Subscriber{ID: "h", Event: "order.created", Handle: rec.handler("h")}))
-	ids := emit(t, b, p, 3)
-	expectOnce(t, rec, []string{"h"}, ids)
-	if n := rec.total.Load(); n != 3 {
-		t.Fatalf("deliveries = %d, want only the 3 events emitted after the group registered", n)
+	later := emit(t, b, p, 3)
+	expectOnce(t, rec, []string{"h"}, append(early, later...))
+
+	// An event nobody handles, now that a registry exists: sent to nobody.
+	if err := pgx.BeginFunc(context.Background(), b.pool, func(tx pgx.Tx) error {
+		ev, _ := eventbus.NewEvent("nobody.cares", 1)
+		return p.EmitTx(context.Background(), tx, ev)
+	}); err != nil {
+		t.Fatal(err)
 	}
+	waitFor(t, "unrouted event marked sent", func() bool { return unsent(t, b.pool) == 0 })
+}
+
+// The registry is lost (Redis restarted without persistence): producers hold
+// events while it is empty, the running consumers register again on their
+// own, and nothing is lost.
+func TestRegistryLossRecovers(t *testing.T) {
+	t.Parallel()
+	b := newTestBus(t)
+	rec := newRecorder()
+	start(t, b.consumerWith("svc", func(o *eventbus.ConsumerOptions) { o.RegistryCheck = 100 * time.Millisecond },
+		eventbus.Subscriber{ID: "h", Event: "order.created", Handle: rec.handler("h")}))
+	p := b.producer()
+	start(t, p)
+	first := emit(t, b, p, 2)
+	expectOnce(t, rec, []string{"h"}, first)
+
+	conn, err := bullmq.NewRedisConnection(context.Background(), b.redis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.Client().Del(context.Background(),
+		b.prefix+":eventbus:routes", b.prefix+":eventbus:groups", b.prefix+":eventbus:version", b.prefix+":eventbus:epoch").Err(); err != nil {
+		t.Fatal(err)
+	}
+	second := emit(t, b, p, 3)
+	expectOnce(t, rec, []string{"h"}, append(first, second...))
 }
 
 // H: the relay dies between pushing and marking the rows sent. The rows are
@@ -304,24 +348,82 @@ func TestUnrecoverableHandlerIsNotRetried(t *testing.T) {
 	if n := badCalls.Load(); n != 1 {
 		t.Fatalf("unrecoverable handler ran %d times, want 1", n)
 	}
+	// The handler that gave up sends the job to the failed set (the dead
+	// letter queue), even though the retry that completed it succeeded.
+	waitFor(t, "job in the failed set", func() bool { return b.failedJobs("svc") == 1 })
 }
 
-// Rolling deploy: one instance of the group already handles a new event, an
-// old one does not. Jobs taken by the old instance fail retryably and end
-// up on the new one; nothing is lost or marked done without its handler.
+// failedJobs counts the jobs in a group's failed set.
+func (b *bus) failedJobs(group string) int64 {
+	b.t.Helper()
+	ctx := context.Background()
+	q, err := bullmq.NewQueue(ctx, group, &bullmq.QueueOptions{Connection: b.redis, Prefix: b.prefix})
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	defer q.Close()
+	n, err := q.GetFailedCount(ctx)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	return n
+}
+
+// A handler that panics, among several, fails its delivery like an error
+// (retried) instead of crashing the process.
+func TestHandlerPanicIsAnError(t *testing.T) {
+	t.Parallel()
+	b := newTestBus(t)
+	rec := newRecorder()
+	var calls atomic.Int32
+	start(t, b.consumer("svc",
+		eventbus.Subscriber{ID: "steady", Event: "order.created", Handle: rec.handler("steady")},
+		eventbus.Subscriber{ID: "boom", Event: "order.created", Handle: func(ctx context.Context, ev eventbus.Event) error {
+			if calls.Add(1) == 1 {
+				panic("nil map write")
+			}
+			return rec.handler("boom")(ctx, ev)
+		}}))
+	p := b.producer()
+	start(t, p)
+	ids := emit(t, b, p, 1)
+	expectOnce(t, rec, []string{"steady", "boom"}, ids)
+}
+
+// Rolling deploy: an old instance of the group lacks the handler of an event
+// that newer code handles. While only the old instance runs, it hands every
+// job off; with a single attempt per job, every event still reaches the new
+// instance once it starts: handing a job off spends no attempt.
 func TestRollingDeployMissingHandlerRetries(t *testing.T) {
 	t.Parallel()
 	b := newTestBus(t)
 	rec := newRecorder()
-	old := b.consumer("svc", eventbus.Subscriber{ID: "legacy", Event: "other.event", Handle: rec.handler("legacy")})
-	start(t, old)
-	newer := b.consumer("svc",
-		eventbus.Subscriber{ID: "legacy", Event: "other.event", Handle: rec.handler("legacy")},
-		eventbus.Subscriber{ID: "fresh", Event: "order.created", Handle: rec.handler("fresh")})
-	start(t, newer)
+	oneAttempt := func(o *eventbus.ConsumerOptions) { o.Attempts = 1 }
+	subsV2 := func() []eventbus.Subscriber {
+		return []eventbus.Subscriber{
+			{ID: "legacy", Event: "other.event", Handle: rec.handler("legacy")},
+			{ID: "fresh", Event: "order.created", Handle: rec.handler("fresh")},
+		}
+	}
+	// A v2 instance registered the new route, then went away (rollout in
+	// progress); the old v1 instance runs alone.
+	v2 := b.consumerWith("svc", oneAttempt, subsV2()...)
+	if err := v2.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := v2.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	start(t, b.consumerWith("svc", oneAttempt, eventbus.Subscriber{ID: "legacy", Event: "other.event", Handle: rec.handler("legacy")}))
 	p := b.producer()
 	start(t, p)
 	ids := emit(t, b, p, 10)
+	waitFor(t, "events relayed", func() bool { return unsent(t, b.pool) == 0 })
+	time.Sleep(time.Second) // the v1 instance takes and hands off the jobs
+	if n := rec.total.Load(); n != 0 {
+		t.Fatalf("%d deliveries without the handler", n)
+	}
+	start(t, b.consumerWith("svc", oneAttempt, subsV2()...))
 	expectOnce(t, rec, []string{"fresh"}, ids)
 }
 
@@ -462,28 +564,88 @@ func TestDeliveredEventContent(t *testing.T) {
 	}
 }
 
-// The relay works whatever the pool's query mode (raw values are binary in
-// the default mode, text in the simple protocol used behind PgBouncer).
-func TestRelaySimpleProtocol(t *testing.T) {
+// Emitting and relaying work whatever the pool's query mode: raw values are
+// binary in the default mode and text in the simple protocol; payloads must
+// not be sent as bytea (simple and exec modes, used behind PgBouncer).
+func TestQueryModes(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeExec, pgx.QueryExecModeCacheDescribe} {
+		t.Run(mode.String(), func(t *testing.T) {
+			t.Parallel()
+			b := newTestBus(t)
+			cfg, err := pgxpool.ParseConfig(testdb.DSN(b.pool))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.ConnConfig.DefaultQueryExecMode = mode
+			pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(pool.Close)
+			rec := newRecorder()
+			start(t, b.consumer("svc", eventbus.Subscriber{ID: "h", Event: "order.created", Handle: rec.handler("h")}))
+			p := eventbus.NewProducer(pool, eventbus.ProducerOptions{Redis: b.redis, Prefix: b.prefix, RelayInterval: 50 * time.Millisecond})
+			start(t, p)
+			var ids []string
+			if err := pgx.BeginFunc(context.Background(), pool, func(tx pgx.Tx) error {
+				one, _ := eventbus.NewEvent("order.created", map[string]any{"one": true})
+				single := []eventbus.Event{one}
+				if err := p.EmitTx(context.Background(), tx, single...); err != nil { // single-event path
+					return err
+				}
+				two := make([]eventbus.Event, 2)
+				two[0], _ = eventbus.NewEvent("order.created", map[string]any{"html": "<b>&</b>"})
+				two[1] = eventbus.Event{Name: "order.created"}                     // null payload
+				if err := p.EmitTx(context.Background(), tx, two...); err != nil { // array path
+					return err
+				}
+				ids = []string{single[0].ID, two[0].ID, two[1].ID}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			expectOnce(t, rec, []string{"h"}, ids)
+			if n := unsent(t, b.pool); n != 0 {
+				t.Fatalf("unsent = %d", n)
+			}
+		})
+	}
+}
+
+// Registry lost with two groups: one registers again at once, the other
+// only much later. The relay keeps routing to both (the routes it knew stay
+// for RegistryGrace), so the slow group loses nothing.
+func TestRegistryLossWithTwoGroups(t *testing.T) {
 	t.Parallel()
 	b := newTestBus(t)
-	cfg, err := pgxpool.ParseConfig(testdb.DSN(b.pool))
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-	simple, err := pgxpool.NewWithConfig(context.Background(), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(simple.Close)
 	rec := newRecorder()
-	start(t, b.consumer("svc", eventbus.Subscriber{ID: "h", Event: "order.created", Handle: rec.handler("h")}))
-	p := eventbus.NewProducer(simple, eventbus.ProducerOptions{Redis: b.redis, Prefix: b.prefix, RelayInterval: 50 * time.Millisecond})
+	start(t, b.consumerWith("fast", func(o *eventbus.ConsumerOptions) { o.RegistryCheck = 100 * time.Millisecond },
+		eventbus.Subscriber{ID: "f", Event: "order.created", Handle: rec.handler("f")}))
+	start(t, b.consumerWith("slow", func(o *eventbus.ConsumerOptions) { o.RegistryCheck = time.Hour },
+		eventbus.Subscriber{ID: "s", Event: "order.created", Handle: rec.handler("s")}))
+	p := b.producer()
 	start(t, p)
-	ids := emit(t, b, p, 5)
-	expectOnce(t, rec, []string{"h"}, ids)
-	if n := unsent(t, b.pool); n != 0 {
-		t.Fatalf("unsent = %d", n)
+	first := emit(t, b, p, 2)
+	expectOnce(t, rec, []string{"f", "s"}, first)
+
+	ctx := context.Background()
+	conn, err := bullmq.NewRedisConnection(ctx, b.redis)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer conn.Close()
+	keys := []string{b.prefix + ":eventbus:routes", b.prefix + ":eventbus:groups", b.prefix + ":eventbus:version", b.prefix + ":eventbus:epoch"}
+	if err := conn.Client().Del(ctx, keys...).Err(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "fast group registered again", func() bool {
+		ok, _ := conn.Client().HExists(ctx, b.prefix+":eventbus:groups", "fast").Result()
+		return ok
+	})
+	if ok, _ := conn.Client().HExists(ctx, b.prefix+":eventbus:groups", "slow").Result(); ok {
+		t.Fatal("slow group registered again already: the test does not exercise the grace")
+	}
+	second := emit(t, b, p, 3)
+	expectOnce(t, rec, []string{"f", "s"}, append(first, second...))
 }

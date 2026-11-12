@@ -15,17 +15,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/imdat99/saga"
+	"github.com/imdat99/saga/eventbus/internal/registry"
 	"github.com/imdat99/saga/internal/uuidv7"
 )
-
-const defaultPrefix = "bull"
 
 // ProducerOptions configures a Producer.
 type ProducerOptions struct {
 	// Redis is the BullMQ connection.
 	Redis bullmq.RedisConnectionOptions
 	// Prefix is the BullMQ key prefix (default "bull"); producers and
-	// consumers of one bus must use the same.
+	// consumers of one bus must use the same. In Redis Cluster it needs a
+	// hash tag, e.g. "{bull}".
 	Prefix string
 	// RelayInterval is the pause between relay passes when the outbox is
 	// empty (default 500ms). A full batch is followed at once by the next.
@@ -45,12 +45,17 @@ type ProducerOptions struct {
 	FailedRetention time.Duration
 	// CleanupInterval is the pause between retention passes (default 1m).
 	CleanupInterval time.Duration
-	Logger          *slog.Logger
+	// RegistryGrace is how long a relay keeps routing to the groups it
+	// knew when the registry is lost (Redis restarted without persistence),
+	// while the running consumers register again (default 2m; keep it above
+	// the consumers' RegistryCheck, 30s by default).
+	RegistryGrace time.Duration
+	Logger        *slog.Logger
 }
 
 func (o *ProducerOptions) setDefaults() {
 	if o.Prefix == "" {
-		o.Prefix = defaultPrefix
+		o.Prefix = registry.DefaultPrefix
 	}
 	if o.RelayInterval <= 0 {
 		o.RelayInterval = 500 * time.Millisecond
@@ -70,13 +75,13 @@ func (o *ProducerOptions) setDefaults() {
 	if o.CleanupInterval <= 0 {
 		o.CleanupInterval = time.Minute
 	}
+	if o.RegistryGrace <= 0 {
+		o.RegistryGrace = 2 * time.Minute
+	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
 }
-
-// ErrStarted means Start was called twice, or Subscribe after Start.
-var ErrStarted = errors.New("eventbus: already started")
 
 // Producer emits events into the outbox and relays the outbox to the
 // consumer groups' queues. Every instance of a service that emits may run
@@ -135,21 +140,20 @@ func (p *Producer) EmitTx(ctx context.Context, tx pgx.Tx, events ...Event) error
 	return nil
 }
 
-var jsonNull = []byte("null")
-
-// emitOne is the common case, without arrays: the payload is passed as is
-// (no copy into a string).
+// emitOne is the common case, without arrays. The payload goes as a string
+// cast to jsonb: a []byte would be sent as bytea in the simple and exec
+// query modes (PgBouncer setups), which jsonb rejects.
 func emitOne(ctx context.Context, tx pgx.Tx, ev *Event, runID string, inRun bool) error {
-	payload := []byte(ev.Payload)
-	if len(payload) == 0 {
-		payload = jsonNull
+	payload := string(ev.Payload)
+	if payload == "" {
+		payload = "null"
 	}
 	var err error
 	if inRun {
-		_, err = tx.Exec(ctx, `INSERT INTO eventbus.staging (id, run_id, name, payload) VALUES ($1, $2, $3, $4)`,
+		_, err = tx.Exec(ctx, `INSERT INTO eventbus.staging (id, run_id, name, payload) VALUES ($1, $2, $3, $4::text::jsonb)`,
 			ev.ID, runID, ev.Name, payload)
 	} else {
-		_, err = tx.Exec(ctx, `INSERT INTO eventbus.outbox (id, name, payload) VALUES ($1, $2, $3)`,
+		_, err = tx.Exec(ctx, `INSERT INTO eventbus.outbox (id, name, payload) VALUES ($1, $2, $3::text::jsonb)`,
 			ev.ID, ev.Name, payload)
 	}
 	return err
@@ -159,23 +163,23 @@ func emitOne(ctx context.Context, tx pgx.Tx, ev *Event, runID string, inRun bool
 func emitMany(ctx context.Context, tx pgx.Tx, events []Event, runID string, inRun bool) error {
 	ids := make([]string, len(events))
 	names := make([]string, len(events))
-	payloads := make([][]byte, len(events))
+	payloads := make([]string, len(events)) // strings, see emitOne
 	for i := range events {
-		ids[i], names[i], payloads[i] = events[i].ID, events[i].Name, events[i].Payload
-		if len(payloads[i]) == 0 {
-			payloads[i] = jsonNull
+		ids[i], names[i], payloads[i] = events[i].ID, events[i].Name, string(events[i].Payload)
+		if payloads[i] == "" {
+			payloads[i] = "null"
 		}
 	}
 	var err error
 	if inRun {
 		_, err = tx.Exec(ctx, `
 			INSERT INTO eventbus.staging (id, run_id, name, payload)
-			SELECT id, $4, name, payload FROM unnest($1::uuid[], $2::text[], $3::jsonb[]) AS e(id, name, payload)`,
+			SELECT id, $4, name, payload::jsonb FROM unnest($1::uuid[], $2::text[], $3::text[]) AS e(id, name, payload)`,
 			ids, names, payloads, runID)
 	} else {
 		_, err = tx.Exec(ctx, `
 			INSERT INTO eventbus.outbox (id, name, payload)
-			SELECT id, name, payload FROM unnest($1::uuid[], $2::text[], $3::jsonb[]) AS e(id, name, payload)`,
+			SELECT id, name, payload::jsonb FROM unnest($1::uuid[], $2::text[], $3::text[]) AS e(id, name, payload)`,
 			ids, names, payloads)
 	}
 	return err
@@ -186,14 +190,16 @@ func emitMany(ctx context.Context, tx pgx.Tx, events []Event, runID string, inRu
 // compensated included); needs_attention also emits NeedsAttentionEvent. One
 // statement, run under the run's row lock.
 func (p *Producer) RunEnded(ctx context.Context, tx pgx.Tx, run saga.RunInfo) error {
-	var attention []byte
+	var attention *string // as text, see emitOne
 	if run.Status == saga.StatusNeedsAttention {
-		var err error
-		if attention, err = json.Marshal(NeedsAttention{
+		raw, err := json.Marshal(NeedsAttention{
 			RunID: run.ID, Workflow: run.Workflow, Version: run.Version, Error: run.Error,
-		}); err != nil {
+		})
+		if err != nil {
 			return fmt.Errorf("eventbus: encode %s: %w", NeedsAttentionEvent, err)
 		}
+		s := string(raw)
+		attention = &s
 	}
 	if _, err := tx.Exec(ctx, `
 		WITH staged AS (
@@ -204,7 +210,7 @@ func (p *Producer) RunEnded(ctx context.Context, tx pgx.Tx, run saga.RunInfo) er
 			SELECT id, name, payload, created_at FROM staged WHERE $2
 		)
 		INSERT INTO eventbus.outbox (id, name, payload)
-		SELECT $3, $4, $5::jsonb WHERE $5::jsonb IS NOT NULL`,
+		SELECT $3, $4, $5::text::jsonb WHERE $5::text IS NOT NULL`,
 		run.ID, run.Status == saga.StatusDone, uuidv7.New(), NeedsAttentionEvent, attention); err != nil {
 		return fmt.Errorf("eventbus: run %s ended: %w", run.ID, err)
 	}
@@ -275,7 +281,10 @@ type relayState struct {
 	qmu    sync.Mutex
 	queues map[string]*bullmq.Queue // by group
 
-	reg           *registry
+	reg           *registry.Table // the routing used: loaded, plus sticky
+	loaded        *registry.Table // as read from Redis
+	sticky        *registry.Table // routes kept after a registry loss
+	stickyUntil   time.Time
 	keepCompleted *bullmq.RemoveOnFinish // shared by every job
 	keepFailed    *bullmq.RemoveOnFinish
 
@@ -290,6 +299,13 @@ type relayState struct {
 	opts    []bullmq.JobOptions
 	batches map[string][]bullmq.BulkJob
 }
+
+// Scratch kept between passes is bounded: past these, a pass that needed
+// more allocates afresh and the next one starts small again.
+const (
+	maxKeptArena = 4 << 20
+	maxKeptJobs  = 8192
+)
 
 // maxInternedNames bounds the event-name intern table (a relay sees few
 // distinct names; the bound only protects against unbounded name sets).
@@ -327,7 +343,7 @@ func (st *relayState) close() {
 	for _, q := range st.queues {
 		_ = q.Close()
 	}
-	st.queues = map[string]*bullmq.Queue{}
+	st.queues = nil // queue() refuses from now on
 	_ = st.conn.Close()
 }
 
@@ -335,6 +351,9 @@ func (st *relayState) close() {
 func (st *relayState) queue(ctx context.Context, group, prefix string) (*bullmq.Queue, error) {
 	st.qmu.Lock()
 	defer st.qmu.Unlock()
+	if st.queues == nil {
+		return nil, errors.New("eventbus: producer stopped")
+	}
 	if q, ok := st.queues[group]; ok {
 		return q, nil
 	}
@@ -347,22 +366,52 @@ func (st *relayState) queue(ctx context.Context, group, prefix string) (*bullmq.
 }
 
 // refresh reloads the routing table if the registry changed since the last
-// load: one GET per pass otherwise.
-func (st *relayState) refresh(ctx context.Context, prefix string) error {
-	v, err := readVersion(ctx, st.conn.Client(), prefix)
+// load: one round trip per pass otherwise. When the registry was lost (its
+// epoch changed), the routes known before are kept for grace on top of what
+// is registered again, so that a group that has not registered again yet
+// still gets its events. Queues of groups no longer routed are closed.
+func (st *relayState) refresh(ctx context.Context, prefix string, grace time.Duration) error {
+	state, err := registry.ReadState(ctx, st.conn.Client(), prefix)
 	if err != nil {
 		return err
 	}
-	if st.reg != nil && st.reg.version == v {
+	now := time.Now()
+	stickyExpired := st.sticky != nil && !now.Before(st.stickyUntil)
+	if st.loaded != nil && state.Version == st.loaded.Version && state.Epoch == st.loaded.Epoch && !stickyExpired {
 		return nil
 	}
-	reg, err := loadRegistry(ctx, st.conn.Client(), prefix)
+	loaded, err := registry.Load(ctx, st.conn.Client(), prefix)
 	if err != nil {
 		return err
 	}
-	st.reg = reg
+	if st.loaded != nil && st.loaded.Epoch != "" && loaded.Epoch != st.loaded.Epoch {
+		st.sticky, st.stickyUntil = st.reg, now.Add(grace) // st.reg includes an earlier sticky
+	} else if stickyExpired {
+		st.sticky = nil
+	}
+	st.loaded, st.reg = loaded, loaded
+	if st.sticky != nil {
+		st.reg = registry.Union(loaded, st.sticky)
+	}
+	for g := range st.batches {
+		if st.reg.Groups[g] == nil {
+			delete(st.batches, g)
+		}
+	}
+	st.qmu.Lock()
+	for g, q := range st.queues { // nil map after close: no iteration
+		if st.reg.Groups[g] == nil {
+			_ = q.Close()
+			delete(st.queues, g)
+		}
+	}
+	st.qmu.Unlock()
 	return nil
 }
+
+// holding reports whether events must wait: no group was ever registered
+// (and none is remembered from before a registry loss).
+func (st *relayState) holding() bool { return st.loaded.Version == 0 && st.sticky == nil }
 
 func (p *Producer) relayLoop(ctx context.Context, st *relayState) {
 	defer close(st.relay)
@@ -404,8 +453,14 @@ const relaySelect = `
 // ignores. Events no group handles are marked sent (nobody to deliver to).
 // It returns the number of events.
 func (p *Producer) relayOnce(ctx context.Context, st *relayState) (int, error) {
-	if err := st.refresh(ctx, p.opts.Prefix); err != nil {
+	if err := st.refresh(ctx, p.opts.Prefix, p.opts.RegistryGrace); err != nil {
 		return 0, err
+	}
+	if st.holding() {
+		// No consumer group ever registered (first deploy, or Redis lost
+		// the registry): hold the events instead of marking them sent to
+		// nobody. Consumers register again on their own (RegistryCheck).
+		return 0, nil
 	}
 	n := 0
 	err := pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
@@ -440,6 +495,13 @@ func (p *Producer) relayOnce(ctx context.Context, st *relayState) (int, error) {
 // (binary uuid, text name, text JSON) instead of scanning, to stay off pgx's
 // per-value allocations.
 func (st *relayState) read(ctx context.Context, tx pgx.Tx, limit int) error {
+	if cap(st.arena) > maxKeptArena {
+		st.arena = nil // a burst of large events: do not keep its arena
+	}
+	if cap(st.opts) > maxKeptJobs {
+		st.opts = nil
+	}
+	clear(st.rows) // no reference to the previous arena past the new length
 	st.rows, st.arena = st.rows[:0], st.arena[:0]
 	st.sentIDs = append(st.sentIDs[:0], '{')
 	rows, err := tx.Query(ctx, relaySelect, limit)
@@ -536,9 +598,13 @@ const jobIDMax = 36 + 1 + 200
 // push builds the jobs of st.rows, one per (event, interested group), and
 // adds them with one AddBulk per group.
 func (st *relayState) push(ctx context.Context, prefix string) error {
+	for g, jobs := range st.batches {
+		clear(jobs) // drop references to the previous pass's payloads
+		st.batches[g] = jobs[:0]
+	}
 	total := 0
 	for i := range st.rows {
-		total += len(st.reg.byEvent[st.rows[i].name])
+		total += len(st.reg.ByEvent[st.rows[i].name])
 	}
 	if total == 0 {
 		return nil
@@ -547,15 +613,11 @@ func (st *relayState) push(ctx context.Context, prefix string) error {
 		st.opts = make([]bullmq.JobOptions, total)
 	}
 	opts := st.opts[:total]
-	for g, jobs := range st.batches {
-		clear(jobs) // drop references to the previous pass's payloads
-		st.batches[g] = jobs[:0]
-	}
 	k := 0
 	var buf [jobIDMax]byte
 	for i := range st.rows {
 		r := &st.rows[i]
-		routes := st.reg.byEvent[r.name]
+		routes := st.reg.ByEvent[r.name]
 		if len(routes) == 0 {
 			continue
 		}
@@ -566,15 +628,29 @@ func (st *relayState) push(ctx context.Context, prefix string) error {
 			*o = bullmq.JobOptions{
 				// BullMQ rejects custom ids with a single ':'; '.' is safe:
 				// group names are validated, event ids are UUIDs.
-				JobID:            string(append(buf[:36], rt.suffix...)),
-				Attempts:         rt.attempts,
-				Backoff:          rt.backoff,
+				JobID:            string(append(buf[:36], rt.Suffix...)),
+				Attempts:         rt.Attempts,
+				Backoff:          rt.Backoff,
 				RemoveOnComplete: st.keepCompleted,
 				RemoveOnFail:     st.keepFailed,
 			}
-			st.batches[rt.group] = append(st.batches[rt.group], bullmq.BulkJob{Name: r.name, Data: r.data, Opts: o})
+			st.batches[rt.Group] = append(st.batches[rt.Group], bullmq.BulkJob{Name: r.name, Data: r.data, Opts: o})
 		}
 	}
+	return st.addAll(ctx, prefix)
+}
+
+// addAll adds every group's batch, the groups in parallel: each AddBulk is
+// a few Redis round trips, which would otherwise add up per group.
+func (st *relayState) addAll(ctx context.Context, prefix string) error {
+	// Every queue first: no goroutine may still be pushing (reading this
+	// pass's arena and options) when addAll returns, whatever fails.
+	type push struct {
+		group string
+		q     *bullmq.Queue
+		jobs  []bullmq.BulkJob
+	}
+	pushes := make([]push, 0, len(st.batches))
 	for group, jobs := range st.batches {
 		if len(jobs) == 0 {
 			continue
@@ -583,11 +659,29 @@ func (st *relayState) push(ctx context.Context, prefix string) error {
 		if err != nil {
 			return err
 		}
-		if _, err := q.AddBulk(ctx, jobs); err != nil {
-			return fmt.Errorf("eventbus: push to %s: %w", group, err)
-		}
+		pushes = append(pushes, push{group, q, jobs})
 	}
-	return nil
+	if len(pushes) == 1 { // the common case: no goroutine
+		if _, err := pushes[0].q.AddBulk(ctx, pushes[0].jobs); err != nil {
+			return fmt.Errorf("eventbus: push to %s: %w", pushes[0].group, err)
+		}
+		return nil
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []error
+	for _, ps := range pushes {
+		group, q, jobs := ps.group, ps.q, ps.jobs
+		wg.Go(func() {
+			if _, err := q.AddBulk(ctx, jobs); err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("eventbus: push to %s: %w", group, err))
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 func (p *Producer) retentionLoop(ctx context.Context, done chan<- struct{}) {

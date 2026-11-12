@@ -1,10 +1,6 @@
 package eventbus
 
-import (
-	"context"
-
-	"github.com/imdat99/bullmq"
-)
+import "context"
 
 // SetAfterPush installs a hook between pushing a batch and marking it sent.
 func (p *Producer) SetAfterPush(fn func() error) { p.afterPush = fn }
@@ -20,17 +16,4 @@ func (p *Producer) BenchRelay(ctx context.Context) (func(context.Context) (int, 
 		return nil, nil, err
 	}
 	return func(ctx context.Context) (int, error) { return p.relayOnce(ctx, st) }, st.close, nil
-}
-
-// BenchProcess returns the job processor of a consumer without a worker
-// (benchmarks): handlers from Subscribe.
-func (c *Consumer) BenchProcess() func(context.Context, *bullmq.Job) error {
-	s := &consumerState{group: c.group, handlers: map[string][]Subscriber{}}
-	for _, sub := range c.subs {
-		s.handlers[sub.Event] = append(s.handlers[sub.Event], sub)
-	}
-	return func(ctx context.Context, j *bullmq.Job) error {
-		_, err := s.process(ctx, j)
-		return err
-	}
 }

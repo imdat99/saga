@@ -29,84 +29,64 @@ package eventbus
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
-	"regexp"
-	"time"
 
-	"github.com/imdat99/bullmq"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/lock"
 
+	"github.com/imdat99/saga/eventbus/consume"
 	"github.com/imdat99/saga/eventbus/migrations"
+)
+
+// The consumer side lives in package consume (no Postgres, saga or River
+// dependency, for services that only consume); these aliases keep it
+// reachable from eventbus for services that do both.
+type (
+	// Event is a domain event.
+	Event = consume.Event
+	// Handler processes one delivery of an event.
+	Handler = consume.Handler
+	// Subscriber is one handler of a consumer group for one event name.
+	Subscriber = consume.Subscriber
+	// NeedsAttention is the payload of NeedsAttentionEvent.
+	NeedsAttention = consume.NeedsAttention
+	// Consumer is one instance of a consumer group.
+	Consumer = consume.Consumer
+	// ConsumerOptions configures a Consumer.
+	ConsumerOptions = consume.Options
+	// RegistryOptions locates the routing registry.
+	RegistryOptions = consume.RegistryOptions
 )
 
 // NeedsAttentionEvent is emitted (to the outbox) when a run is parked as
 // needs_attention. Its payload is a NeedsAttention.
-const NeedsAttentionEvent = "saga.needs_attention"
+const NeedsAttentionEvent = consume.NeedsAttentionEvent
 
-// NeedsAttention is the payload of NeedsAttentionEvent.
-type NeedsAttention struct {
-	RunID    string `json:"run_id"`
-	Workflow string `json:"workflow"`
-	Version  int    `json:"version"`
-	Error    string `json:"error"`
-}
-
-// Event is a domain event.
-type Event struct {
-	// ID is assigned by EmitTx (UUIDv7). Handlers deduplicate on it.
-	ID      string          `json:"id"`
-	Name    string          `json:"name"`
-	Payload json.RawMessage `json:"payload"`
-	// At is when the event was emitted (database time).
-	At time.Time `json:"at"`
-}
+// ErrStarted means Start was called twice, or Subscribe after Start.
+var ErrStarted = consume.ErrStarted
 
 // NewEvent builds an event with a JSON payload.
-func NewEvent(name string, payload any) (Event, error) {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return Event{}, fmt.Errorf("eventbus: encode %s: %w", name, err)
-	}
-	return Event{Name: name, Payload: raw}, nil
-}
-
-// Decode unmarshals the payload into v.
-func (e Event) Decode(v any) error { return json.Unmarshal(e.Payload, v) }
-
-// Handler processes one delivery of an event. A returned error makes the
-// delivery retried with the group's backoff (handlers of the same event that
-// succeeded are not run again); wrap it with Unrecoverable to give up on this
-// handler for this event at once (the job then ends in the failed set, the
-// dead letter queue, once the other handlers are done).
-type Handler func(ctx context.Context, ev Event) error
+func NewEvent(name string, payload any) (Event, error) { return consume.NewEvent(name, payload) }
 
 // Unrecoverable marks a handler error as not worth retrying.
-func Unrecoverable(err error) error {
-	if err == nil {
-		return nil
-	}
-	return bullmq.NewUnrecoverableError(err.Error())
+func Unrecoverable(err error) error { return consume.Unrecoverable(err) }
+
+// NewConsumer returns a consumer of group (see consume.New).
+func NewConsumer(group string, opts ConsumerOptions) (*Consumer, error) {
+	return consume.New(group, opts)
 }
 
-// Subscriber is one handler of a consumer group for one event name.
-type Subscriber struct {
-	// ID names the subscriber within its group; it is recorded in a job when
-	// the handler succeeded, so that a retry of the job skips it. Stable
-	// across deploys. Letters, digits, '.', '_', '-'.
-	ID string
-	// Event is the event name subscribed to.
-	Event string
-	// Handle processes deliveries.
-	Handle Handler
+// Unregister removes a consumer group (see consume.Unregister).
+func Unregister(ctx context.Context, o RegistryOptions, group string) error {
+	return consume.Unregister(ctx, o, group)
 }
 
-// nameRE validates subscriber IDs and group names: they end up in Redis keys
-// and job ids, where ':' and '|' have a meaning.
-var nameRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,200}$`)
+// Forget removes one event from a group's routes (see consume.Forget).
+func Forget(ctx context.Context, o RegistryOptions, group, event string) error {
+	return consume.Forget(ctx, o, group, event)
+}
 
 // migrateLockID serializes Migrate across instances starting at once.
 const migrateLockID = 0x5a6a_0002

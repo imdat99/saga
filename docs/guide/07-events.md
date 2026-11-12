@@ -36,20 +36,22 @@ Every instance may run the relay: passes use `SKIP LOCKED`, so instances split t
 
 ## Setup in a consumer service
 
+A service that only consumes imports `github.com/imdat99/saga/eventbus/consume`: it depends on BullMQ only (no saga engine, no Postgres driver). `eventbus.NewConsumer` and the other consumer names in `eventbus` are aliases of it, for services that also produce.
+
 ```go
-billing, err := eventbus.NewConsumer("billing", eventbus.ConsumerOptions{
+billing, err := consume.New("billing", consume.Options{
 	Redis:       bullmq.RedisConnectionOptions{URL: redisURL},
 	Concurrency: 20,              // jobs in parallel per instance (default 10)
 	Attempts:    8,               // deliveries before the job fails (default 5)
 	Backoff:     2 * time.Second, // first retry delay, doubled (default 1s)
 })
-_ = billing.Subscribe(eventbus.Subscriber{ID: "invoice", Event: "order.created", Handle: invoices.OnOrderCreated})
-_ = billing.Subscribe(eventbus.Subscriber{ID: "ledger", Event: "order.created", Handle: ledger.OnOrderCreated})
+_ = billing.Subscribe(consume.Subscriber{ID: "invoice", Event: "order.created", Handle: invoices.OnOrderCreated})
+_ = billing.Subscribe(consume.Subscriber{ID: "ledger", Event: "order.created", Handle: ledger.OnOrderCreated})
 if err := billing.Start(ctx); err != nil { ... } // registers the group's events, starts the worker
 defer billing.Stop(shutdownCtx)
 ```
 
-A service that both emits and handles events creates both (the example modulith does). Producers and consumers of one bus must use the same Redis and `Prefix`.
+A service that both emits and handles events creates both (the example modulith does). Producers and consumers of one bus must use the same Redis and `Prefix`; with Redis Cluster the prefix needs a hash tag, e.g. `{bull}`, as BullMQ requires.
 
 ## Emitting
 
@@ -98,14 +100,16 @@ Delivery is **at least once** and **unordered**:
 - deduplicate by `Event.ID` (e.g. with `idem.Do` keyed by it);
 - re-read current state instead of trusting the order of events;
 - a returned error retries the delivery to the group with its backoff, **running again only the handlers that failed**: the ones that succeeded are recorded in the job;
-- `eventbus.Unrecoverable(err)` gives up on that handler for that event at once; the other handlers still run and retry normally, and the job then ends in BullMQ's failed set (the dead letter queue, kept 7 days).
+- `eventbus.Unrecoverable(err)` gives up on that handler for that event at once; the other handlers still run and retry normally, and the job then ends in BullMQ's failed set (the dead letter queue, kept 7 days);
+- a panicking handler counts as a failed delivery (retried), it does not crash the process.
 
 ## Deploying consumers
 
-- **All instances of a group run the same handlers.** During a rolling deploy, an old instance that takes a job for an event only the new code handles puts it back in the queue (without spending an attempt) for an instance that has the handler.
+- **All instances of a group run the same handlers.** During a rolling deploy, an old instance that takes a job for an event only the new code handles puts it back in the queue (without spending an attempt) for an instance that has the handler, for up to `HandOffWindow` (30 minutes) after the event was relayed; the delay between hand-offs grows with the job's age (a tenth of it, 0.5 to 30 seconds), so a forgotten route does not load Redis.
 - **Routes are a union.** Removing a handler from the code does not unroute its event (an old instance may still handle it). Once no instance handles it any more, remove the route: `eventbus.Forget(ctx, eventbus.RegistryOptions{Redis: ...}, "billing", "order.created")`.
 - **Retiring a whole service:** `eventbus.Unregister(ctx, eventbus.RegistryOptions{Redis: ...}, "billing")`, then drain or delete its queue. Stopping its instances is not enough: its queue keeps filling while it is registered.
-- **A new group** receives the events relayed after its first `Start`, not the ones before.
+- **A new group** receives the events relayed after its first `Start`, not the ones before. On a first deploy, before **any** group has registered, producers hold the events in the outbox instead of dropping them.
+- **If Redis loses the registry** (restart without persistence), relays notice (the registry's epoch changed) and keep routing to the groups they knew for `RegistryGrace` (2 minutes), while running consumers register again within `RegistryCheck` (30 seconds). A relay started after the loss, or a group with no running consumer, is not covered: after Redis lost its data, start one consumer of every group, then the producers ([Operations](../operations.md#event-bus)).
 - A group that is down keeps receiving jobs in its queue (registration is durable) and processes them when it comes back: watch the queue size in Redis.
 
 ## The needs_attention event

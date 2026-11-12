@@ -36,20 +36,22 @@ Instance nào cũng chạy relay được: mỗi lượt dùng `SKIP LOCKED`, n�
 
 ## Thiết lập ở service consumer
 
+Service chỉ consume thì import `github.com/imdat99/saga/eventbus/consume`: package này chỉ phụ thuộc BullMQ (không có saga engine, không có driver Postgres). `eventbus.NewConsumer` và các tên khác phía consumer trong `eventbus` là alias của nó, dành cho service vừa phát vừa xử lý.
+
 ```go
-billing, err := eventbus.NewConsumer("billing", eventbus.ConsumerOptions{
+billing, err := consume.New("billing", consume.Options{
 	Redis:       bullmq.RedisConnectionOptions{URL: redisURL},
 	Concurrency: 20,              // số job chạy song song mỗi instance (mặc định 10)
 	Attempts:    8,               // số lần giao trước khi job thất bại (mặc định 5)
 	Backoff:     2 * time.Second, // độ trễ retry đầu tiên, gấp đôi dần (mặc định 1s)
 })
-_ = billing.Subscribe(eventbus.Subscriber{ID: "invoice", Event: "order.created", Handle: invoices.OnOrderCreated})
-_ = billing.Subscribe(eventbus.Subscriber{ID: "ledger", Event: "order.created", Handle: ledger.OnOrderCreated})
+_ = billing.Subscribe(consume.Subscriber{ID: "invoice", Event: "order.created", Handle: invoices.OnOrderCreated})
+_ = billing.Subscribe(consume.Subscriber{ID: "ledger", Event: "order.created", Handle: ledger.OnOrderCreated})
 if err := billing.Start(ctx); err != nil { ... } // đăng ký event của group, chạy worker
 defer billing.Stop(shutdownCtx)
 ```
 
-Service vừa phát vừa xử lý event thì tạo cả hai (example modulith làm vậy). Producer và consumer của cùng một bus phải dùng chung Redis và `Prefix`.
+Service vừa phát vừa xử lý event thì tạo cả hai (example modulith làm vậy). Producer và consumer của cùng một bus phải dùng chung Redis và `Prefix`; với Redis Cluster, prefix cần hash tag, ví dụ `{bull}`, như BullMQ yêu cầu.
 
 ## Phát event
 
@@ -98,14 +100,16 @@ Giao nhận là **ít nhất một lần** và **không theo thứ tự**:
 - khử trùng lặp theo `Event.ID` (ví dụ `idem.Do` với key là nó);
 - đọc lại state hiện tại thay vì tin vào thứ tự event;
 - lỗi trả về làm lần giao tới group được retry theo backoff của group, **chỉ chạy lại các handler đã lỗi**: các handler đã thành công được ghi lại trong job;
-- `eventbus.Unrecoverable(err)` bỏ cuộc ngay với handler đó cho event đó; các handler khác vẫn chạy và retry bình thường, rồi job kết thúc trong failed set của BullMQ (dead letter queue, giữ 7 ngày).
+- `eventbus.Unrecoverable(err)` bỏ cuộc ngay với handler đó cho event đó; các handler khác vẫn chạy và retry bình thường, rồi job kết thúc trong failed set của BullMQ (dead letter queue, giữ 7 ngày);
+- handler bị panic được tính là một lần giao lỗi (sẽ retry), không làm sập process.
 
 ## Deploy consumer
 
-- **Mọi instance của một group chạy cùng các handler.** Trong rolling deploy, instance cũ nhận phải job của một event mà chỉ code mới xử lý sẽ trả nó về queue (không tốn attempt) cho instance có handler.
+- **Mọi instance của một group chạy cùng các handler.** Trong rolling deploy, instance cũ nhận phải job của một event mà chỉ code mới xử lý sẽ trả nó về queue (không tốn attempt) cho instance có handler, trong tối đa `HandOffWindow` (30 phút) kể từ khi event được relay; độ trễ giữa các lần trả về tăng theo tuổi của job (một phần mười tuổi, từ 0,5 tới 30 giây), nên một định tuyến bị bỏ quên không đè tải lên Redis.
 - **Định tuyến là phép hợp.** Gỡ một handler khỏi code không gỡ định tuyến của event đó (instance cũ có thể vẫn xử lý). Khi không còn instance nào xử lý, gỡ định tuyến: `eventbus.Forget(ctx, eventbus.RegistryOptions{Redis: ...}, "billing", "order.created")`.
 - **Ngừng hẳn một service:** `eventbus.Unregister(ctx, eventbus.RegistryOptions{Redis: ...}, "billing")`, rồi xử lý hết hoặc xoá queue của nó. Chỉ tắt các instance là chưa đủ: queue vẫn tiếp tục nhận job chừng nào group còn được đăng ký.
-- **Group mới** nhận các event được relay sau lần `Start` đầu tiên của nó, không nhận các event trước đó.
+- **Group mới** nhận các event được relay sau lần `Start` đầu tiên của nó, không nhận các event trước đó. Ở lần deploy đầu tiên, khi **chưa có group nào** đăng ký, producer giữ event lại trong outbox thay vì bỏ đi.
+- **Nếu Redis mất registry** (restart không có persistence), relay nhận ra (epoch của registry đổi) và tiếp tục định tuyến tới các group nó đã biết trong `RegistryGrace` (2 phút), trong lúc các consumer đang chạy tự đăng ký lại trong vòng `RegistryCheck` (30 giây). Cơ chế này không bao phủ relay khởi động sau khi registry bị mất, cũng như group không có consumer nào đang chạy: sau khi Redis mất dữ liệu, hãy chạy một consumer của mọi group trước, rồi mới chạy producer ([Operations](../operations.md#event-bus)).
 - Group đang tắt vẫn tiếp tục nhận job vào queue (đăng ký là bền vững) và xử lý khi chạy lại: theo dõi kích thước queue trong Redis.
 
 ## Event needs_attention

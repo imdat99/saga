@@ -44,4 +44,4 @@ Compensators are found by step name, so recovery can compensate without the work
 
 ## Events
 
-Modules emit events with `eventbus.Bus.EmitTx` in their own transaction. From inside a step, events are staged and only published (moved to the outbox) in the transaction that marks the run `done`; a compensated run publishes nothing. The relay pushes the outbox to BullMQ, one job per subscriber, deduplicated by job id.
+Modules emit events with `eventbus.Producer.EmitTx` in their own transaction. From inside a step, events are staged and only published (moved to the outbox) in the transaction that marks the run `done`; a compensated run publishes nothing. The relay pushes the outbox to BullMQ, one job per (event, consumer group) registered in Redis, deduplicated by job id; each group (a service) runs all its handlers of the event.

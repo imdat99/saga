@@ -81,23 +81,18 @@ Every lease renewal updates `saga.run.lease_until`, an indexed column, so it is 
 
 ## Event bus
 
-```go
-bus := eventbus.New(pool, eventbus.Options{Redis: bullmq.RedisConnectionOptions{URL: redisURL}})
-bus.Subscribe(eventbus.Subscriber{ID: "billing.invoice", Event: "order.created", Handle: onOrderCreated})
-eng, _ := saga.New(pool, saga.Options{Hooks: []saga.RunHook{bus}})
-_ = eventbus.Migrate(ctx, pool)
-_ = bus.Start(ctx)
-defer bus.Stop(shutdownCtx)
-```
+Producers (`eventbus.NewProducer`, Postgres and Redis) emit into the outbox and relay it; consumer groups (`consume.New` / `eventbus.NewConsumer`, Redis only) handle events. See [guide chapter 7](guide/07-events.md).
 
 - Redis must run with `maxmemory-policy noeviction` and AOF; watch its memory. Losing Redis delays delivery of events still in the outbox; it does not lose them. Events already pushed (rows marked sent) and not yet processed live only in Redis: with `appendfsync everysec` up to one second of them can be lost in a Redis crash, use `appendfsync always` if that matters.
-- Every instance runs the relay; batches use `SKIP LOCKED`. Register the same subscribers on every instance, or events relayed by an instance that lacks one skip it.
-- Each subscriber gets its own BullMQ queue by default. If you group subscribers on one `Queue`, every instance with a handler for one of them needs handlers for all (`Start` refuses otherwise): a worker that takes a job it cannot handle wastes an attempt.
-- A subscriber registered without a handler on any instance accumulates jobs in Redis forever: remove it from every instance (or drain its queue) when retiring it.
+- Routing lives in Redis (`<prefix>:eventbus:routes`, `:groups`, `:version`, `:epoch`): every relay pushes each event to every registered group that handles it, one job per (event, group), job id `<eventID>.<group>`. In Redis Cluster the prefix needs a hash tag (`{bull}`).
+- Every producer instance runs the relay; batches use `SKIP LOCKED`. One pass reads up to `RelayBatch` (200) events, pushes each group's jobs with one `AddBulk` (groups in parallel), and marks the batch sent; a relay crash in between re-pushes the same job ids, which BullMQ ignores within `CompletedRetention` (24h).
+- Until some group has ever registered, producers hold the outbox (nothing is marked sent). Afterwards, an event no group handles is marked sent to nobody. If the registry is lost (its epoch changes), relays keep the routes they knew for `RegistryGrace` (2 minutes) while consumers register again (`RegistryCheck`, 30 seconds). This does not cover everything: a relay started after the loss knows no routes (once the first group registers, the others miss events until they register again), and a group with no running consumer is never registered again (its events are dropped after the grace). After Redis lost its data, start one consumer of every group first, then the producers.
+- A consumer group's queue keeps filling while the group is registered, even if all its instances are down: watch queue sizes. Retire a group with `Unregister`, an event of a group with `Forget`.
 - One event that cannot be pushed (e.g. Redis OOM) blocks the relay for the whole batch it is in, on every instance, until it can.
-- Delivery is at least once and unordered: handlers deduplicate by `Event.ID` and re-read state.
-- Failed jobs stay 7 days in BullMQ's failed set (dead letter queue); completed jobs 24h, which is also the window in which a re-pushed job id is ignored.
+- Delivery is at least once and unordered: handlers deduplicate by `Event.ID` and re-read state. A retry runs only the handlers of the group that failed.
+- Failed jobs stay 7 days in BullMQ's failed set (dead letter queue); completed jobs 24h.
 - Sent outbox rows, and staging rows of runs that already ended, are deleted after `Retention` (7 days) by a retention loop every `CleanupInterval` (1 minute), in batches of 5000 until caught up.
+- Cost per relayed job is dominated by BullMQ's `AddBulk` (about 24 allocations and its Redis round trips); a group with several handlers of an event costs one job, not one per handler ([benchmarks](benchmarks.md)).
 
 ## Retention and vacuum
 

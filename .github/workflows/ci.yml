@@ -56,7 +56,7 @@ jobs:
         run: go test -run '^$' -bench . -benchtime 500x -count 5 . | tee bench.txt
       - name: Benchmarks (event bus)
         shell: bash
-        run: go test -run '^$' -bench . -benchtime 300x -count 5 ./eventbus | tee -a bench.txt
+        run: go test -run '^$' -bench . -benchtime 300x -count 5 ./eventbus/... | tee -a bench.txt
       - name: Performance budget
         run: go run ./internal/tools/benchgate -budget .github/perf-budget.txt -summary "$GITHUB_STEP_SUMMARY" bench.txt
       - uses: actions/upload-artifact@v4

@@ -2,10 +2,8 @@ package eventbus_test
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 
-	"github.com/imdat99/bullmq"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/imdat99/saga/eventbus"
@@ -63,25 +61,6 @@ func benchRelayOn(b *testing.B, tb *bus, consumers ...*eventbus.Consumer) {
 		n, err := pass(ctx)
 		if err != nil || n != benchBatch {
 			b.Fatalf("relayed %d, %v", n, err)
-		}
-	}
-}
-
-// Processing one job by a group with one handler (decode and dispatch).
-func BenchmarkConsume(b *testing.B) {
-	tb := newTestBus(b)
-	c := tb.consumer("billing", eventbus.Subscriber{ID: "invoice", Event: "order.created", Handle: noop})
-	process := c.BenchProcess()
-	data, _ := json.Marshal(eventbus.Event{
-		ID: "0196a0b2-0000-7000-8000-000000000001", Name: "order.created",
-		Payload: json.RawMessage(`{"order_id":"o-123","amount":4200}`),
-	})
-	job := &bullmq.Job{Name: "order.created", Data: data}
-	ctx := context.Background()
-	b.ReportAllocs()
-	for b.Loop() {
-		if err := process(ctx, job); err != nil {
-			b.Fatal(err)
 		}
 	}
 }
