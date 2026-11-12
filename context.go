@@ -2,7 +2,9 @@ package saga
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/imdat99/saga/internal/store"
 )
@@ -11,6 +13,12 @@ import (
 // A step re-executed after a crash gets the same key, so the module it calls
 // can recognise the retry and return the first result instead of acting twice.
 type Key string
+
+// RunID returns the id of the run the key belongs to.
+func (k Key) RunID() string {
+	id, _, _ := strings.Cut(string(k), ":")
+	return id
+}
 
 // Ctx is the context a workflow function receives. Steps must be called with
 // it, one after another (not from concurrent goroutines): their position in
@@ -48,6 +56,105 @@ func (c *runCtx) nextSeq() int {
 	return c.seq
 }
 
+// errSuspended is the fatal error of a run that parked itself.
+var errSuspended = fmt.Errorf("%w (parked)", ErrRunWaiting)
+
+// suspend stops the workflow function after the run was parked.
+func (c *runCtx) suspend() error { return c.setFatal(errSuspended) }
+
+func (c *runCtx) nonDeterministic(seq int, recorded, now string) error {
+	return c.setFatal(fmt.Errorf("%w: position %d recorded %q, now %q", ErrNonDeterministic, seq, recorded, now))
+}
+
+// Error kinds persisted with a failed step, so replay rebuilds an error that
+// still matches the engine's sentinels and Permanent.
+const (
+	kindPermanent    = "permanent"
+	kindStepTimeout  = "step_timeout"
+	kindRunTimeout   = "run_timeout"
+	kindAwaitTimeout = "await_timeout"
+)
+
+var kindSentinels = map[string]error{
+	kindLockHeld:     ErrLockHeld,
+	kindLockLost:     ErrLockLost,
+	kindStepTimeout:  ErrStepTimeout,
+	kindRunTimeout:   ErrRunTimeout,
+	kindAwaitTimeout: ErrAwaitTimeout,
+}
+
+// errorKind classifies err for persistence.
+func errorKind(err error) string {
+	switch {
+	case IsPermanent(err):
+		return kindPermanent
+	case errors.Is(err, ErrRunTimeout):
+		return kindRunTimeout
+	case errors.Is(err, ErrAwaitTimeout):
+		return kindAwaitTimeout
+	case errors.Is(err, ErrStepTimeout):
+		return kindStepTimeout
+	}
+	return ""
+}
+
+// replayedError is a step failure rebuilt from history: same message, and
+// errors.Is still matches the engine sentinel it wrapped. Errors defined by
+// the application come back with their message only.
+type replayedError struct {
+	msg      string
+	sentinel error
+}
+
+func (e *replayedError) Error() string { return e.msg }
+func (e *replayedError) Unwrap() error { return e.sentinel }
+
+// recordedError rebuilds the error of a step that failed in an earlier
+// execution.
+func recordedError(msg, kind string) error {
+	switch kind {
+	case kindPermanent:
+		return Permanent(errors.New(msg))
+	case kindLockHeld:
+		return Permanent(&replayedError{msg: msg, sentinel: ErrLockHeld})
+	}
+	if s, ok := kindSentinels[kind]; ok {
+		return &replayedError{msg: msg, sentinel: s}
+	}
+	return errors.New(msg)
+}
+
+// failedOutcome is the row of a step that failed with cause. A step whose
+// attempt timed out may have taken effect: it stays uncertain, so it is still
+// compensated.
+func failedOutcome(status string, cause error) store.Outcome {
+	return store.Outcome{
+		Status: status, Error: cause.Error(), ErrorKind: errorKind(cause),
+		Uncertain: errors.Is(cause, ErrStepTimeout),
+	}
+}
+
+// reservedPrefix marks the engine's own pseudo-steps (Sleep, Await, Now, Rand).
+const reservedPrefix = "saga."
+
+func isReserved(name string) bool { return strings.HasPrefix(name, reservedPrefix) }
+
+// fail records err as fatal. If the run context was cancelled, the
+// cancellation cause (ErrLeaseLost, ErrShutdown, the caller's error) wins over
+// the error it provoked, such as a failed query.
+func (c *runCtx) fail(err error) error {
+	return c.setFatal(interruption(c, err))
+}
+
+// interruption returns the cancellation cause of ctx in place of err when ctx
+// is done, except for ErrLeaseLost which is already the most precise answer.
+func interruption(ctx context.Context, err error) error {
+	if err != nil && ctx.Err() != nil && !errors.Is(err, ErrLeaseLost) {
+		return context.Cause(ctx)
+	}
+	return err
+}
+
 func (c *runCtx) setFatal(err error) error {
 	if c.fatal == nil {
 		c.fatal = err
@@ -63,7 +170,7 @@ func stepKey(runID string, seq int, name string) Key {
 // it (e.g. the event bus) to tell whether they are called from a saga step.
 func RunIDFrom(ctx context.Context) (string, bool) {
 	c, ok := ctx.Value(runCtxKey{}).(*runCtx)
-	if !ok {
+	if !ok || c == nil {
 		return "", false
 	}
 	return c.run.ID, true
@@ -72,9 +179,12 @@ func RunIDFrom(ctx context.Context) (string, bool) {
 type uncertainKey struct{}
 
 // CompensationUncertain reports whether a compensator is undoing a step whose
-// outcome is unknown: the process died after the step started and before its
-// result was recorded. The compensation data is then the zero value, and the
-// compensator must look up what (if anything) was done under its Key.
+// outcome is not fully known: the process died after the step started and
+// before its result was recorded, a retry was pending, or one of its attempts
+// timed out (and may have taken effect). The compensation data is the zero
+// value when no attempt recorded success; otherwise it is the data of the
+// successful attempt. Either way the compensator must look up what (if
+// anything) was done under its Key, e.g. with idem.Abort.
 func CompensationUncertain(ctx context.Context) bool {
 	v, _ := ctx.Value(uncertainKey{}).(bool)
 	return v

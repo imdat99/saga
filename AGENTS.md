@@ -28,7 +28,7 @@ SAGA_TEST_DSN=postgres://saga:saga@localhost:5432/saga?sslmode=disable make test
 
 ## Architecture invariants (do not break)
 
-- **Fencing:** every write on behalf of a run goes through `store.Fenced`, which locks the run row and checks `owner_id` + `lease_version`. Never write `saga.run` / `saga.step` for a running saga outside it.
+- **Fencing:** every write on behalf of a run goes through `store.Fenced`, which locks the run row and checks `owner_id` + `lease_version`, or through the single-statement fenced checkpoints (`StartStepFenced`, `FinishStepFenced`) whose CTE takes the same lock and check. Never write `saga.run` / `saga.step` for a running saga outside them.
 - **Lease:** `AcquireLease` only takes expired leases, never re-grants a live one (not even to the same owner).
 - **Idempotency:** steps run at least once; the step `Key` (`runID:seq:name`) is stable across re-executions and is the module's dedup key. Compensators are at-least-once and idempotent.
 - **Replay:** workflow functions are re-executed on resume; recorded steps return stored outputs; a different step at the same position is non-determinism and parks the run as `needs_attention`.
@@ -46,5 +46,7 @@ SAGA_TEST_DSN=postgres://saga:saga@localhost:5432/saga?sslmode=disable make test
 - No emojis.
 
 ## Skills
+
+Before any Go coding, review, debugging, troubleshooting, or setup task, load the `samber/cc-skills-golang@golang-how-to` skill first — it routes to whichever other Go skills the task needs.
 
 Go skills are installed in `.agents/skills/` (see `skills-lock.json`). Load the relevant one before the matching work, e.g. `golang-database` for store/migrations, `golang-concurrency` and `golang-context` for heartbeat, workers and shutdown, `golang-benchmark` / `golang-performance` for M6, `golang-lint` when adding `.golangci.yml`.

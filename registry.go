@@ -15,18 +15,24 @@ type compensator func(ctx context.Context, k Key, compData json.RawMessage) erro
 // workflowRunner executes a workflow function from its persisted input.
 type workflowRunner func(c *runCtx, input json.RawMessage) (json.RawMessage, error)
 
+// registeredComp is a compensator with its retry policy.
+type registeredComp struct {
+	fn     compensator
+	policy RetryPolicy
+}
+
 var registry = struct {
 	sync.RWMutex
-	compensators map[string]compensator
+	compensators map[string]registeredComp
 	steps        map[string]struct{}
 	workflows    map[string]workflowRunner
 }{
-	compensators: map[string]compensator{},
+	compensators: map[string]registeredComp{},
 	steps:        map[string]struct{}{},
 	workflows:    map[string]workflowRunner{},
 }
 
-func registerStep(name string, comp compensator) {
+func registerStep(name string, comp compensator, policy RetryPolicy) {
 	registry.Lock()
 	defer registry.Unlock()
 	if _, dup := registry.steps[name]; dup {
@@ -34,11 +40,11 @@ func registerStep(name string, comp compensator) {
 	}
 	registry.steps[name] = struct{}{}
 	if comp != nil {
-		registry.compensators[name] = comp
+		registry.compensators[name] = registeredComp{fn: comp, policy: policy}
 	}
 }
 
-func lookupCompensator(name string) (compensator, bool) {
+func lookupCompensator(name string) (registeredComp, bool) {
 	registry.RLock()
 	defer registry.RUnlock()
 	c, ok := registry.compensators[name]

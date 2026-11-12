@@ -1,4 +1,4 @@
-.PHONY: up down test test-chaos lint
+.PHONY: up down test test-chaos lint lint-fix fmt
 
 up:
 	docker compose up -d
@@ -15,3 +15,10 @@ test-chaos:
 
 lint:
 	golangci-lint run ./...
+
+lint-fix:
+	golangci-lint run --fix ./...
+
+fmt:
+	golangci-lint fmt ./...
+

@@ -24,6 +24,42 @@ var (
 	// belong to a workflow execution.
 	ErrNotInWorkflow = errors.New("saga: step called outside a workflow")
 
+	// ErrEngineStopped means Stop was called: the engine takes no new work.
+	ErrEngineStopped = errors.New("saga: engine stopped")
+
+	// ErrShutdown is the cancellation cause of runs interrupted by
+	// Engine.Stop.
+	ErrShutdown = errors.New("saga: engine shutting down")
+
+	// ErrWorkflowNotRegistered means a run belongs to a workflow name and
+	// version this binary does not define (e.g. during a rolling deploy).
+	ErrWorkflowNotRegistered = errors.New("saga: workflow not registered in this binary")
+
+	// ErrRunWaiting means the run is parked (retry backoff, Sleep, Await,
+	// compensation backoff) and continues asynchronously on a started engine.
+	// Use Workflow.Lookup and Handle.Wait for the outcome. Step.Run, Sleep and
+	// Await return it inside workflow functions: return it as is.
+	ErrRunWaiting = errors.New("saga: run waiting")
+
+	// ErrRunTimeout means the run passed the deadline set with
+	// WithRunTimeout. It is checked when a step starts and when a waiting run
+	// wakes up; the workflow then fails and compensates.
+	ErrRunTimeout = errors.New("saga: run deadline exceeded")
+
+	// ErrStepTimeout is the cause of a step attempt cancelled by WithTimeout.
+	// It counts as a transient failure.
+	ErrStepTimeout = errors.New("saga: step attempt timed out")
+
+	// ErrAwaitTimeout means Await gave up waiting for its signal.
+	ErrAwaitTimeout = errors.New("saga: signal not received in time")
+
+	// ErrNotNeedsAttention means RetryCompensation was called for a run that
+	// is not in needs_attention.
+	ErrNotNeedsAttention = errors.New("saga: run does not need attention")
+
+	// ErrRunNotFound means no run exists for the given id or idempotency key.
+	ErrRunNotFound = errors.New("saga: run not found")
+
 	// ErrIdemKeyConflict means the idempotency key is already used by a run
 	// of a different workflow.
 	ErrIdemKeyConflict = errors.New("saga: idempotency key used by another workflow")
@@ -35,6 +71,7 @@ type RunStatus string
 // Run statuses.
 const (
 	StatusRunning        RunStatus = store.RunRunning
+	StatusWaiting        RunStatus = store.RunWaiting
 	StatusCompensating   RunStatus = store.RunCompensating
 	StatusDone           RunStatus = store.RunDone
 	StatusCompensated    RunStatus = store.RunCompensated

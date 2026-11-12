@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -48,8 +49,10 @@ func (l *ledger) snapshot() []string {
 	return append([]string(nil), l.order...)
 }
 
-type in struct{ N int }
-type out struct{ Total int }
+type (
+	in  struct{ N int }
+	out struct{ Total int }
+)
 
 func setup(t *testing.T, opts saga.Options) (*pgxpool.Pool, *saga.Engine) {
 	t.Helper()
@@ -57,11 +60,32 @@ func setup(t *testing.T, opts saga.Options) (*pgxpool.Pool, *saga.Engine) {
 	if err := saga.Migrate(context.Background(), pool); err != nil {
 		t.Fatal(err)
 	}
-	return pool, saga.New(pool, opts)
+	return pool, newEngine(t, pool, opts)
+}
+
+// newEngine returns an engine stopped when the test ends.
+func newEngine(t *testing.T, pool *pgxpool.Pool, opts saga.Options) *saga.Engine {
+	t.Helper()
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelWarn}))
+	}
+	eng, err := saga.New(pool, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := eng.Stop(ctx); err != nil {
+			t.Errorf("stop engine: %v", err)
+		}
+	})
+	return eng
 }
 
 // addStep defines a step adding delta to its input; fail makes it error.
 func addStep(t *testing.T, l *ledger, name string, delta int, fail func() error) *saga.Step[int, int, string] {
+	t.Helper()
 	return saga.DefineStep(testdb.UniqueName(t, name),
 		func(ctx context.Context, k saga.Key, v int) (int, string, error) {
 			if fail != nil {
@@ -198,7 +222,7 @@ func TestResumeAfterCrashReplaysCompletedSteps(t *testing.T) {
 
 	crash.Store(false)
 	expireLeases(t, pool)
-	eng2 := saga.New(pool, saga.Options{})
+	eng2 := newEngine(t, pool, saga.Options{})
 	got, err := wf.Run(context.Background(), eng2, "k1", in{N: 3})
 	if err != nil {
 		t.Fatal(err)
@@ -242,7 +266,7 @@ func TestFencingRejectsStaleOwner(t *testing.T) {
 
 	<-takeover
 	expireLeases(t, pool)
-	eng2 := saga.New(pool, saga.Options{})
+	eng2 := newEngine(t, pool, saga.Options{})
 	got, err := wf.Run(context.Background(), eng2, "k1", in{N: 1})
 	if err != nil || got.Total != 2 {
 		t.Fatalf("takeover run = %+v, %v", got, err)
@@ -263,7 +287,7 @@ func TestFencingRejectsStaleOwner(t *testing.T) {
 
 func TestConcurrentRunsSameKeyExecuteOnce(t *testing.T) {
 	pool, eng := setup(t, saga.Options{})
-	engines := []*saga.Engine{eng, saga.New(pool, saga.Options{})} // two "instances"
+	engines := []*saga.Engine{eng, newEngine(t, pool, saga.Options{})} // two "instances"
 	l := newLedger()
 	gate := make(chan struct{})
 	a := saga.DefineStep(testdb.UniqueName(t, "a"),
@@ -280,7 +304,7 @@ func TestConcurrentRunsSameKeyExecuteOnce(t *testing.T) {
 	const callers = 8
 	var wg sync.WaitGroup
 	var ok, inProgress atomic.Int32
-	for i := 0; i < callers; i++ {
+	for i := range callers {
 		wg.Add(1)
 		go func(e *saga.Engine) {
 			defer wg.Done()
@@ -308,14 +332,14 @@ func TestConcurrentRunsSameKeyExecuteOnce(t *testing.T) {
 }
 
 func TestCompensationFailureNeedsAttention(t *testing.T) {
-	pool, eng := setup(t, saga.Options{CompensateAttempts: 2, CompensateBackoff: time.Millisecond})
+	pool, eng := setup(t, saga.Options{})
 	var compCalls atomic.Int32
 	a := saga.DefineStep(testdb.UniqueName(t, "a"),
 		func(c context.Context, k saga.Key, v int) (int, string, error) { return v, "x", nil },
 		func(c context.Context, k saga.Key, comp string) error {
 			compCalls.Add(1)
 			return errors.New("refund API down")
-		})
+		}, saga.WithCompensatePolicy(saga.RetryPolicy{MaxAttempts: 1}))
 	b := saga.DefineStep(testdb.UniqueName(t, "b"),
 		func(c context.Context, k saga.Key, v int) (int, string, error) { return 0, "", errors.New("boom") }, nil)
 	wf := saga.DefineWorkflow(testdb.UniqueName(t, "wf"), 1, func(c saga.Ctx, v in) (out, error) {
@@ -332,8 +356,8 @@ func TestCompensationFailureNeedsAttention(t *testing.T) {
 	if !errors.As(err, &re) || re.Status != saga.StatusNeedsAttention {
 		t.Fatalf("err = %v, want needs_attention", err)
 	}
-	if compCalls.Load() != 2 {
-		t.Fatalf("compensator called %d times, want 2", compCalls.Load())
+	if compCalls.Load() != 1 {
+		t.Fatalf("compensator called %d times, want 1", compCalls.Load())
 	}
 	var owner *string
 	if err := pool.QueryRow(context.Background(), `SELECT owner_id FROM saga.run`).Scan(&owner); err != nil {
@@ -385,5 +409,59 @@ func expireLeases(t *testing.T, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(context.Background(),
 		`UPDATE saga.run SET lease_until = now() - interval '1 second' WHERE lease_until IS NOT NULL`); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A run started from inside another run's step is its own run: its steps and
+// compensators do not see the parent's id.
+func TestNestedRunIsolatesRunID(t *testing.T) {
+	_, eng := setup(t, saga.Options{})
+	seen := make(chan string, 4)
+	child := saga.DefineStep(testdb.UniqueName(t, "child"),
+		func(ctx context.Context, k saga.Key, v int) (int, string, error) {
+			id, _ := saga.RunIDFrom(ctx)
+			seen <- "step:" + id
+			return 0, "", errors.New("fail child")
+		}, nil)
+	before := saga.DefineStep(testdb.UniqueName(t, "before"),
+		func(ctx context.Context, k saga.Key, v int) (int, string, error) { return v, "x", nil },
+		func(ctx context.Context, k saga.Key, comp string) error {
+			id, ok := saga.RunIDFrom(ctx)
+			seen <- fmt.Sprintf("comp:%s:%v", id, ok)
+			return nil
+		})
+	inner := saga.DefineWorkflow(testdb.UniqueName(t, "inner"), 1, func(c saga.Ctx, v in) (out, error) {
+		if _, err := before.Run(c, v.N); err != nil {
+			return out{}, err
+		}
+		_, err := child.Run(c, v.N)
+		return out{}, err
+	})
+	var innerID string
+	parent := saga.DefineStep(testdb.UniqueName(t, "parent"),
+		func(ctx context.Context, k saga.Key, v int) (int, string, error) {
+			_, err := inner.Run(ctx, eng, "inner-1", in{N: v})
+			h, _ := inner.Lookup(ctx, eng, "inner-1")
+			innerID = h.ID()
+			if _, ok := errors.AsType[*saga.RunError](err); ok {
+				return v, "", nil
+			}
+			return v, "", err
+		}, nil)
+	outer := saga.DefineWorkflow(testdb.UniqueName(t, "outer"), 1, func(c saga.Ctx, v in) (out, error) {
+		x, err := parent.Run(c, v.N)
+		return out{Total: x}, err
+	})
+	if _, err := outer.Run(context.Background(), eng, "outer-1", in{N: 1}); err != nil {
+		t.Fatal(err)
+	}
+	close(seen)
+	var got []string
+	for s := range seen {
+		got = append(got, s)
+	}
+	want := []string{"step:" + innerID, "comp::false"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("run ids seen = %v, want %v", got, want)
 	}
 }

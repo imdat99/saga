@@ -1,0 +1,153 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  build-tags:
+    - chaos
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 50
+
+linters:
+  enable:
+    # correctness
+    - govet
+    - staticcheck
+    - unused
+    - errcheck
+    - errorlint
+    - nilerr
+    - forcetypeassert
+    - copyloopvar
+    - durationcheck
+    - reassign
+    # style
+    - gocritic
+    - revive
+    - whitespace
+    - godot
+    - misspell
+    - dupword
+    - predeclared
+    - errname
+    - asciicheck
+    # complexity
+    - gocyclo
+    - nestif
+    # performance
+    - perfsprint
+    - unconvert
+    - ineffassign
+    # security and resources
+    - gosec
+    - bidichk
+    - bodyclose
+    - noctx
+    - fatcontext
+    - rowserrcheck
+    # logging
+    - sloglint
+    - loggercheck
+    # testing
+    - thelper
+    - usetesting
+    # modernization and meta
+    - modernize
+    - intrange
+    - usestdlibvars
+    - nolintlint
+    # architecture
+    - depguard
+
+  settings:
+    depguard:
+      rules:
+        # The library core must not depend on its optional add-ons or on apps.
+        core:
+          files:
+            - "!**/eventbus/**"
+            - "!**/idem/**"
+            - "!**/examples/**"
+            - "!**/test/**"
+            - "!$test"
+            - "!**/migrate.go"
+          deny:
+            - pkg: github.com/imdat99/saga/eventbus
+              desc: the saga core exposes hooks; eventbus plugs into them, not the reverse
+            - pkg: github.com/imdat99/saga/idem
+              desc: idem is a module-side helper, the core must not need it
+            - pkg: github.com/imdat99/saga/examples
+              desc: the library must not import example code
+            - pkg: database/sql
+              desc: use pgx/v5 (database/sql only inside Migrate for goose)
+        # Modules of the example modulith are isolated: they talk through
+        # flows (sagas) and events, never by importing each other.
+        module-inventory:
+          files:
+            - "**/examples/modulith/internal/modules/inventory/**"
+          deny:
+            - pkg: github.com/imdat99/saga/examples/modulith/internal/modules/payment
+              desc: modules must not import each other
+            - pkg: github.com/imdat99/saga/examples/modulith/internal/modules/order
+              desc: modules must not import each other
+        module-payment:
+          files:
+            - "**/examples/modulith/internal/modules/payment/**"
+          deny:
+            - pkg: github.com/imdat99/saga/examples/modulith/internal/modules/inventory
+              desc: modules must not import each other
+            - pkg: github.com/imdat99/saga/examples/modulith/internal/modules/order
+              desc: modules must not import each other
+        module-order:
+          files:
+            - "**/examples/modulith/internal/modules/order/**"
+          deny:
+            - pkg: github.com/imdat99/saga/examples/modulith/internal/modules/inventory
+              desc: modules must not import each other
+            - pkg: github.com/imdat99/saga/examples/modulith/internal/modules/payment
+              desc: modules must not import each other
+    errcheck:
+      check-type-assertions: true
+    gocyclo:
+      min-complexity: 20
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: var-naming
+        - name: indent-error-flow
+        - name: error-strings
+        - name: error-naming
+        - name: receiver-naming
+        - name: unexported-return
+        - name: context-as-argument
+        - name: blank-imports
+    gosec:
+      excludes:
+        - G115 # integer overflow conversions: values here are bounded (seq, attempts)
+    sloglint:
+      kv-only: true
+
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+          - forcetypeassert
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/imdat99/saga
