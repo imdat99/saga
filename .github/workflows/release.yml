@@ -1,0 +1,78 @@
+name: release
+
+# On every push to main (a merged pull request): run the whole CI gate (lint,
+# unit/integration and chaos tests, performance budget), then tag the next
+# semantic version and publish a GitHub release, so that
+#   go get github.com/imdat99/saga@vX.Y.Z   (or @latest)
+# installs it. Nothing is tagged if any CI job fails.
+#
+# The version comes from the commit messages since the last tag
+# (.github/scripts/next-version.sh): feat -> minor, fix and others -> patch,
+# "type!:" or "BREAKING CHANGE" -> major (minor while below v1.0.0).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # re-run the release for the current main
+
+permissions:
+  contents: read
+
+# One release at a time, in merge order: two merges in a row must not compute
+# the same next version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  tag:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the tag, create the release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # history and tags, to compute the version
+
+      - name: Next version
+        id: version
+        run: |
+          tag=$(.github/scripts/next-version.sh)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -z "$tag" ]; then
+            echo "HEAD is already released; nothing to tag." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Tag and publish the release
+        if: steps.version.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          {
+            echo "Released **$TAG**:"
+            echo
+            echo '```'
+            echo "go get $(awk '/^module /{print $2}' go.mod)@$TAG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Announce the version to the Go module proxy
+        if: steps.version.outputs.tag != ''
+        # A public module is then installable at once (instead of on the first
+        # `go get`). Private repositories are not on the public proxy: users
+        # set GOPRIVATE=github.com/<owner>/* and this step is allowed to fail.
+        continue-on-error: true
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          module=$(awk '/^module /{print $2}' go.mod)
+          curl -fsS "https://proxy.golang.org/${module}/@v/${TAG}.info"

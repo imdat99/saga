@@ -15,6 +15,8 @@ Legend: `[x]` done, `[~]` in progress, `[ ]` todo. Update this file in the same 
 | M4 | Business locks, `idem` helper | Done |
 | M5 | Event bus: staging, outbox, relay to BullMQ | Done |
 | M6 | Example modulith, e2e, benchmarks, observability | Done |
+| M7 | GC and allocation diet of the hot path | Done |
+| M8 | Allocation diet, second pass | Done |
 
 ## M0 - Skeleton
 
@@ -101,6 +103,41 @@ Legend: `[x]` done, `[~]` in progress, `[ ]` todo. Update this file in the same 
 - [x] Retention: `Engine.PurgeRuns`, `Options.Retention` (leader periodic job), index `run_ended_idx` (migration 00005); autovacuum guidance in `docs/operations.md`
 - [x] `docs/`: concepts, guarantees and failure modes, operations, patterns; README rewritten
 
+## M7 - Allocation diet
+
+Baseline (`BenchmarkStepRun`, one run = 10 no-op steps, `SAGA_BENCH_ASYNC_COMMIT=1`): ~500 allocs/op, 26 KB/op. Profile: the two checkpoint statements per step are ~330 of them (pgx boxes every argument into `any`, builds scan plans and a rows object per query, plus 4 allocations of context watching per query); the rest is per-run setup and the end-of-run transaction (5 round trips).
+
+- [x] Round 1 - hot-path statements on `pgconn` directly: named prepared statements, text parameters from a pooled buffer (no boxing), binary results decoded by hand; fallback to the pgx path when the pool is not in `QueryExecModeCacheStatement` (PgBouncer setups) or has a tracer. Result: ~500 -> 260 allocs/op, 26 -> 12.7 KB/op. Review 1: PASS (nits fixed; tests added for tracer fallback, cancellation mid-statement, stale prepared statement, concurrency, every query mode)
+- [x] Round 2 - engine per-run and per-step allocations: step `Key` in one allocation, no `ListSteps` for a run just inserted, single-statement fenced finish when there are no hooks (5 round trips -> 1 at the end of a run), no `comp_data` for steps without compensator (a compensator added later sees them as uncertain), registry keyed by struct, lazy per-run logger. Result: 260 -> 156 allocs/op, 12.7 -> 9.1 KB/op. Review 2: PASS (docs and decision log added)
+- [x] Round 3 - one context watch per execution (`store.Interrupt`) instead of pgconn's per statement, step results encoded into a per-run buffer (`json/v2.MarshalWrite` with v1 options, byte-identical), benchmark refresh in `docs/benchmarks.md`, decision log. Result: 156 -> 69 allocs/op, 9.1 -> 3.7 KB/op. Review 3: PASS (nits fixed: no deadline reset on a closed connection, bookkeeping test). Overall (benchstat, n=6): 500 -> 69 allocs/op (-86%), 25.6 -> 3.6 KiB/op, -11.5% ns/op, 3 instances +8% runs/s (`docs/benchmarks.md`)
+- Floor left (~69/run, documented): one command tag per statement inside pgconn (~21), the step `Key` string (10), `reflect.New` in json for value outputs (~8, passing pointers would change which `MarshalJSON` methods run), per-execution context/heartbeat/lease setup (~12)
+- [x] Verified: `go test -race -count=10 . ./internal/store`, full suite, chaos tests and `golangci-lint` green; each round reviewed by a subagent (3 rounds, all PASS on the first review)
+
+## M8 - Allocation diet, second pass
+
+Start: 69 allocs/op (`BenchmarkStepRun`). Breakdown per run: ~21 pgconn command tags (one per statement, not addressable without forking pgx), 10 step keys, ~14 per-execution setup (of which 8 for the lease's context watch), ~5 `reflect.New` in json for value outputs, 2 uuid, the rest workflow I/O and benchmark noise. Merging checkpoints (done of step N with start of N+1) was proposed and not chosen (changes the per-step checkpoint invariant).
+
+- [x] Round 4 - step keys carved from a per-execution append-only arena (`unsafe.String` over bytes never written again; 512 B chunks bound what a retained key pins). 69 -> 61. Review: PASS (doc on `Key` about retention, edge-case and GC tests added)
+- [x] Round 5 - context watch folded into the heartbeat entry: fired by the heartbeat's own cancellations and, only when the caller's context can be cancelled, by an AfterFunc on it; statements run on `context.Background()`; covered contexts matched by identity. 61 -> 52. Review: PASS (caller's cause set before Fire, AfterFunc registered outside the heartbeat lock, `end` deferred; tests for caller cancel, caller cause, shutdown and lease loss mid-statement, mutation-checked)
+- [x] Round 6 - encode through a pointer when the type provably encodes the same (no pointer-receiver marshal method on the value or on anything reached through struct fields and arrays), uuid v7 without the reader allocation. 52 -> 40. Review: PASS (byte equality checked against the json/v2 source; extra cases tested: pointer root, omitzero with pointer `IsZero`, pointer `MarshalText` map keys)
+- [x] Verified: benchmarks (interleaved benchstat vs M7: 69 -> 40 allocs/op, -8.5% B/op, latency unchanged), full suite, `-count=10 . ./internal/store`, chaos, lint; one review per round focused on invariants (3 rounds, all PASS on the first review)
+
+## Docs - User guide
+
+- [x] Bilingual user guide: `docs/guide` (English, primary) and `docs/huong-dan` (Vietnamese, same structure): getting started, steps, workflows, runs, waiting, modules (`idem`), event bus, testing, production, troubleshooting
+- [x] `examples/quickstart`: the guide's first program, built and linted with the repository, run against docker compose Postgres (done, compensated, same-key replay)
+- [x] `examples/longrunning`: approval with timeout (`Await`/`Signal`), external job calling back (`SignalKey` on the step key), embargo (`Sleep`), CLI across processes; verified against docker compose Postgres: approve, reject, approval timeout, worker SIGKILLed mid-sleep then finished by another worker
+- [x] `examples/multiworkflow`: parent order fanning out one child shipment per warehouse (child key = step key), signals both ways, two-phase commit, cascading compensation; verified against docker compose Postgres: all shipped, one warehouse out of stock, payment declined after all ready
+- [x] Guide chapter 11 (both languages): API layer or worker: where runs execute, inline `Run` vs `Start`, hybrid `Start` + bounded `Wait`, split API/worker roles, decision table (latencies measured: inline 3-step p50 ~9 ms, `Start`+`Wait` p50 ~27 ms, p90 ~69 ms on the fsync=off test database)
+- [ ] Keep both languages in sync on every API change (rule recorded in the decision log)
+
+## CI and releases
+
+- [x] `ci.yml` (pull requests, and called by `release.yml`): lint + release script tests, `-race` tests, chaos tests, performance budget (`internal/tools/benchgate` against `.github/perf-budget.txt`, medians of 5 runs, report in the job summary, `bench.txt` artifact)
+- [x] `release.yml` (push to `main`): the whole CI gate, then the next semver tag from Conventional Commits (`.github/scripts/next-version.sh`, tested by `next-version_test.sh`), GitHub release with generated notes, Go proxy notified; serialized with a concurrency group
+- [x] Validated locally: actionlint clean, benchgate unit tests, version script tests (9 cases), budget passes on the CI benchmark command (StepRun 40 allocs/op, 3.4 KiB/op, p95 2.4 ms; 3 instances 56 allocs/op, 204 runs/s)
+- [ ] First run on GitHub (needs the push): check the runner's p95 and the three-instance allocations against the budget, adjust with a reason if the hosted runner differs
+
 ## Known limitations (current)
 
 - Recovery needs at least one instance with `Engine.Start`; inline-only deployments resume abandoned runs only when called again with the same `idem_key`.
@@ -117,6 +154,7 @@ Legend: `[x]` done, `[~]` in progress, `[ ]` todo. Update this file in the same 
 - If lease renewal stalls for a whole lock `ttl` while nobody takes the run, another run may take the lock and the holder is not told (narrow: the lease would normally be lost first).
 - Locks are polled, not queued (no fairness, no deadlock detection): take several locks in a fixed order.
 - `idem.Do` under REPEATABLE READ/SERIALIZABLE turns a concurrent duplicate into a serialization error (40001): callers retry.
+- The allocation fast path of hot-path statements (M7) is off when the pool has a pgx tracer (e.g. OpenTelemetry) or a query mode other than `QueryExecModeCacheStatement`: those pools use the regular pgx path, about twice the allocations per step. On the fast path a custom pgconn `BuildContextWatcherHandler` is not used: cancellation interrupts the statement with a connection deadline (pgconn's default behaviour).
 - Every instance relaying must register the same subscribers: a relay that does not know a subscriber skips it for the events it relays (rolling deploy adding a subscriber).
 - The relay holds its outbox rows locked while it calls Redis (bounded batch): a slow Redis slows the relay, it does not lose events. An event that can never be pushed blocks its batch (no quarantine).
 - A `RunHook` that keeps failing (e.g. eventbus schema not migrated) makes the run's terminal transition fail on every resume; the run is never parked.

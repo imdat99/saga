@@ -25,11 +25,18 @@ var registry = struct {
 	sync.RWMutex
 	compensators map[string]registeredComp
 	steps        map[string]struct{}
-	workflows    map[string]workflowRunner
+	workflows    map[workflowID]workflowRunner
 }{
 	compensators: map[string]registeredComp{},
 	steps:        map[string]struct{}{},
-	workflows:    map[string]workflowRunner{},
+	workflows:    map[workflowID]workflowRunner{},
+}
+
+// workflowID keys the registry without formatting a string per lookup (one
+// lookup per run).
+type workflowID struct {
+	name    string
+	version int
 }
 
 func registerStep(name string, comp compensator, policy RetryPolicy) {
@@ -56,9 +63,9 @@ func workflowKey(name string, version int) string { return fmt.Sprintf("%s@%d", 
 func registerWorkflow(name string, version int, run workflowRunner) {
 	registry.Lock()
 	defer registry.Unlock()
-	key := workflowKey(name, version)
+	key := workflowID{name: name, version: version}
 	if _, dup := registry.workflows[key]; dup {
-		panic(fmt.Sprintf("saga: workflow %s defined twice", key))
+		panic(fmt.Sprintf("saga: workflow %s defined twice", workflowKey(name, version)))
 	}
 	registry.workflows[key] = run
 }
@@ -66,6 +73,6 @@ func registerWorkflow(name string, version int, run workflowRunner) {
 func lookupWorkflow(name string, version int) (workflowRunner, bool) {
 	registry.RLock()
 	defer registry.RUnlock()
-	w, ok := registry.workflows[workflowKey(name, version)]
+	w, ok := registry.workflows[workflowID{name: name, version: version}]
 	return w, ok
 }

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,8 @@ import (
 // SAGA_BENCH_ASYNC_COMMIT=1 runs the engine's sessions with
 // synchronous_commit=off, to tell commit (fsync) cost from round trips.
 // SAGA_BENCH_ASYNC_START=1 sets Options.AsyncStepStart.
+// SAGA_BENCH_MAX_CONNS=n sets the engines' pool size (default: pgx's,
+// max(4, GOMAXPROCS)).
 
 const benchSteps = 10
 
@@ -56,6 +59,9 @@ func benchPool(b *testing.B, pool *pgxpool.Pool) *pgxpool.Pool {
 	}
 	if os.Getenv("SAGA_BENCH_ASYNC_COMMIT") == "1" {
 		cfg.ConnConfig.RuntimeParams["synchronous_commit"] = "off"
+	}
+	if n, err := strconv.Atoi(os.Getenv("SAGA_BENCH_MAX_CONNS")); err == nil && n > 0 {
+		cfg.MaxConns = int32(n)
 	}
 	p, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
@@ -147,6 +153,7 @@ func BenchmarkRunsThreeInstances(b *testing.B) {
 	var next atomic.Int64
 	b.ResetTimer() // exclude database and engine setup
 	start := time.Now()
+	b.ReportAllocs()
 	b.SetParallelism(4) // 4 x GOMAXPROCS concurrent callers
 	b.RunParallel(func(pb *testing.PB) {
 		ctx := context.Background()

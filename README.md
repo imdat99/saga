@@ -7,7 +7,7 @@ interrupted run is resumed (or compensated) by whichever instance picks it up.
 River (in Postgres) drives recovery, retries, timers and signals; domain events
 go through a transactional outbox to BullMQ.
 
-Status: milestones M0 to M6 of [the plan](docs/PLAN.md) are implemented. See
+Status: milestones M0 to M8 of [the plan](docs/PLAN.md) are implemented. See
 [TASKS.md](TASKS.md) for the checklist and the known limitations.
 
 ## Usage
@@ -62,11 +62,33 @@ func main() {
 
 ## Documentation
 
+- **User guide**: [English](docs/guide/README.md) | [Tiếng Việt](docs/huong-dan/README.md): getting started, steps, workflows, runs, waiting, modules, events, testing, production, troubleshooting.
 - [Concepts](docs/concepts.md): runs, steps, keys, replay, compensation, parking.
 - [Guarantees and failure modes](docs/guarantees.md): what holds under crashes, partitions and redeploys.
 - [Operations](docs/operations.md): lifecycle, pool sizing, PgBouncer, timing, event bus, retention.
 - [Patterns](docs/patterns.md): long-running external work, payload size.
+- [Quickstart](examples/quickstart/main.go): the two-step transfer of the guide's first chapter.
+- [Multi-workflow](examples/multiworkflow/README.md): a parent fanning out parallel child workflows, signals both ways, two-phase commit, cascading compensation.
+- [Long-running workflow](examples/longrunning/README.md): approval (`Await`/`Signal`), external callback (`SignalKey`), durable timer (`Sleep`), across processes and worker crashes.
 - [Example modulith](examples/modulith): three isolated modules, a checkout flow, HTTP API, multiple instances.
+
+## Install
+
+```bash
+go get github.com/imdat99/saga@latest   # or a specific release: @v0.1.0
+```
+
+Releases are tagged automatically (see below); the list is on the repository's Releases page.
+
+## Releases
+
+Every merge to `main` runs the release workflow (`.github/workflows/release.yml`):
+
+1. The full CI gate (`.github/workflows/ci.yml`): lint, unit and integration tests with `-race`, chaos tests, and the **performance budget**: benchmarks (median of 5 runs) checked against [`.github/perf-budget.txt`](.github/perf-budget.txt) by `internal/tools/benchgate` (allocations per run, bytes per run, p95 step overhead, throughput floor).
+2. If every job passes, the next version is computed from the commit messages since the last tag ([Conventional Commits](https://www.conventionalcommits.org/)): `feat:` bumps the minor version, `fix:` and anything else the patch, `type!:` or `BREAKING CHANGE:` the major (the minor while below v1.0.0).
+3. The tag is pushed, a GitHub release with generated notes is created, and the Go module proxy is told about the version.
+
+Nothing is tagged when a job fails. Pull requests run the same CI gate; protect `main` by requiring the `ci` checks. To change a performance limit, edit the budget file in the PR with the reason (and update `docs/benchmarks.md`).
 
 ## Development
 

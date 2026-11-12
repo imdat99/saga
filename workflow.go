@@ -18,6 +18,7 @@ type Workflow[I, O any] struct {
 	name    string
 	version int
 	timeout time.Duration
+	inJSON  *jsonSlot[I]
 }
 
 // WorkflowOption configures a workflow.
@@ -44,6 +45,7 @@ func DefineWorkflow[I, O any](name string, version int, fn WorkflowFunc[I, O], o
 	for _, o := range opts {
 		o(&cfg)
 	}
+	outJSON := newJSONSlot[O]()
 	registerWorkflow(name, version, func(c *runCtx, raw json.RawMessage) (json.RawMessage, error) {
 		var in I
 		if err := json.Unmarshal(raw, &in); err != nil {
@@ -53,13 +55,13 @@ func DefineWorkflow[I, O any](name string, version int, fn WorkflowFunc[I, O], o
 		if err != nil {
 			return nil, err
 		}
-		b, err := json.Marshal(out)
+		b, err := outJSON.marshal(out)
 		if err != nil {
 			return nil, c.setFatal(fmt.Errorf("encode output of %s: %w", name, err))
 		}
 		return b, nil
 	})
-	return &Workflow[I, O]{name: name, version: version, timeout: cfg.timeout}
+	return &Workflow[I, O]{name: name, version: version, timeout: cfg.timeout, inJSON: newJSONSlot[I]()}
 }
 
 // Name returns the workflow name.
@@ -73,7 +75,7 @@ func (w *Workflow[I, O]) Name() string { return w.name }
 // run continues on a started engine.
 func (w *Workflow[I, O]) Run(ctx context.Context, e *Engine, idemKey string, in I) (O, error) {
 	var zero O
-	raw, err := json.Marshal(in)
+	raw, err := w.inJSON.marshal(in)
 	if err != nil {
 		return zero, fmt.Errorf("encode input of %s: %w", w.name, err)
 	}

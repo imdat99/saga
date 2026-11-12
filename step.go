@@ -25,11 +25,19 @@ type Step[I, O, C any] struct {
 	name   string
 	invoke InvokeFunc[I, O, C]
 	cfg    stepConfig
+	// hasComp: compensation data is only encoded and stored for steps
+	// that have a compensator to read it.
+	hasComp bool
+	// outJSON and compJSON encode outputs and compensation data without
+	// allocating when the types allow it (see jsonSlot).
+	outJSON  *jsonSlot[O]
+	compJSON *jsonSlot[C]
 }
 
 // DefineStep registers a step. Call it at package level: names must be unique
 // and stable across deploys, because recovery finds compensators by name.
-// compensate may be nil for steps without side effects to undo. Names starting
+// compensate may be nil for steps without side effects to undo (no
+// compensation data is stored for them, see CompensationUncertain). Names starting
 // with "saga." are reserved.
 func DefineStep[I, O, C any](
 	name string,
@@ -53,7 +61,10 @@ func defineStep[I, O, C any](
 	for _, o := range opts {
 		o(&cfg)
 	}
-	s := &Step[I, O, C]{name: name, invoke: invoke, cfg: cfg}
+	s := &Step[I, O, C]{
+		name: name, invoke: invoke, cfg: cfg, hasComp: compensate != nil,
+		outJSON: newJSONSlot[O](), compJSON: newJSONSlot[C](),
+	}
 	var comp compensator
 	if compensate != nil {
 		comp = func(ctx context.Context, k Key, raw json.RawMessage) error {
@@ -91,7 +102,7 @@ func (s *Step[I, O, C]) Run(c Ctx, in I) (O, error) {
 	}
 
 	seq := rc.nextSeq()
-	key := stepKey(rc.run.ID, seq, s.name)
+	key := rc.keys.key(rc.run.ID, seq, s.name)
 
 	// A step replayed as "started" was interrupted with an unknown outcome:
 	// whatever happens now, it must be compensated as uncertain. Known from
@@ -143,13 +154,18 @@ func (s *Step[I, O, C]) Run(c Ctx, in I) (O, error) {
 		return zero, s.failed(rc, attemptAt{seq: seq, attempt: attempt, priorUnknown: priorUnknown}, took, err)
 	}
 
-	outRaw, err := json.Marshal(out)
+	// Encoded into the run's scratch buffer: both slices are only read
+	// until FinishStepFenced has sent them.
+	rc.jbuf.Reset()
+	outRaw, err := appendJSON(rc, s.outJSON, out)
 	if err != nil {
 		return zero, rc.setFatal(fmt.Errorf("encode output of %s: %w", s.name, err))
 	}
-	compRaw, err := json.Marshal(comp)
-	if err != nil {
-		return zero, rc.setFatal(fmt.Errorf("encode compensation data of %s: %w", s.name, err))
+	var compRaw json.RawMessage
+	if s.hasComp {
+		if compRaw, err = appendJSON(rc, s.compJSON, comp); err != nil {
+			return zero, rc.setFatal(fmt.Errorf("encode compensation data of %s: %w", s.name, err))
+		}
 	}
 	if err := rc.eng.st.FinishStepFenced(rc, rc.lease, seq, s.name,
 		store.Outcome{Status: store.StepDone, Output: outRaw, CompData: compRaw}); err != nil {

@@ -41,6 +41,42 @@ Second run on the same setup, n=6 (default vs `AsyncStepStart: true`, `SAGA_BENC
 | StepRun p95 per step | 11.6 ms | 7.7 ms | -34% |
 | 3 instances, runs/s | 116 | 159 | +37% |
 
+### Allocation diet (M7)
+
+`SAGA_BENCH_ASYNC_COMMIT=1` on the testcontainers Postgres (commit cost removed, so the CPU side shows), `-benchtime 500x -count 6`, HEAD before M7 vs after, run one after the other:
+
+| Metric | Before | After | Delta |
+| --- | --- | --- | --- |
+| StepRun allocs/op (10-step run) | 500 | 69 | -86% |
+| StepRun B/op | 25.6 KiB | 3.6 KiB | -86% |
+| StepRun ns/op | 24.9 ms | 22.0 ms | -11.5% |
+| StepRun p50 / p95 per step | 1.99 / 2.60 ms | 1.96 / 2.55 ms | ~ (p > 0.05) |
+| 3 instances, allocs/op | 568 | 126 | -78% |
+| 3 instances, runs/s | 191 | 206 | +8% |
+
+Where the 431 allocations went: the hot-path statements run on `pgconn` directly instead of pgx's `Query`/`Scan` (argument boxing, rows and scan plans per query: ~240), one context watch per execution instead of pgconn's per statement (~80), a run ends with one fenced statement instead of a five-round-trip transaction when there are no hooks, a new run does not re-read its history, step keys and outputs are built without `fmt`/extra copies, and steps without a compensator store no `comp_data` (~110).
+
+What is left per run (~69): one command tag string per statement inside pgconn (~21), the step `Key` string handed to each step (10), `reflect.New` inside `encoding/json` for value outputs (~8; passing pointers would change which `MarshalJSON` methods run, hence the stored bytes), and per-execution setup (run id, contexts, lease watch, heartbeat entry). The fast path applies to pools in the default `QueryExecModeCacheStatement` without a tracer (see `docs/operations.md`); other pools keep the pgx path.
+
+### Allocation diet, second pass (M8)
+
+Same setup, M7 vs M8 binaries run interleaved (one `-count 1` run of each, six times) so that machine drift hits both:
+
+| Metric | M7 | M8 | Delta |
+| --- | --- | --- | --- |
+| StepRun allocs/op (10-step run) | 69 | 40 | -42% |
+| StepRun B/op | 3.59 KiB | 3.29 KiB | -8.5% |
+| StepRun ns/op, p50, p95 | 22.8 ms, 2.02, 2.66 ms | 23.3 ms, 2.06, 2.74 ms | ~ (p > 0.3) |
+| 3 instances, allocs/op (sequential runs) | 128 | 98 | -23% |
+
+Latency does not move: per step the engine spends a few microseconds of CPU against about 2 ms of round trips. A first, non-interleaved comparison showed +5% ns/op for M8; interleaving showed it was drift between the two runs.
+
+The three-instance allocations are higher because of pool queueing, not engine code: 24 callers share 18 connections (6 per engine), and each `Acquire` that has to wait allocates a waiter in puddle's semaphore (~42 per run, 21 statements). With `SAGA_BENCH_MAX_CONNS=12` (36 connections) it drops to 47 allocs/op, with the same runs/s and latency (the bottleneck there is the 6 CPUs shared with Postgres). Size pools for the concurrent runs (`docs/operations.md`).
+
+Where the 29 allocations went: step keys from a per-execution arena (-8), the lease's context watch folded into the heartbeat entry (-9; +3 when the caller's context can be cancelled), outputs and inputs encoded through pooled pointers when the type provably encodes the same (-10), run ids generated without uuid's reader allocation (-1).
+
+What is left (~40 per run): ~21 command tags inside pgconn (one per statement), ~2 key chunks, per-execution contexts and heartbeat entry (~6), run id, workflow input/output buffers, and benchmark noise. Going further means fewer statements per step (merging the done checkpoint of a step into the start of the next one, considered and not chosen: it changes the per-step checkpoint invariant) or changing pgx.
+
 ## Reading the numbers
 
 - **Target (p95 < 5 ms per step): met for the engine's own overhead (p95 2.5 ms, commits not waiting for fsync); not met for durable end-to-end latency on this disk**: p95 11.6 ms by default (two durable commits per step), 7.7 ms with `AsyncStepStart` (one), with 2.7 ms per fsync plus Docker's I/O path. Durable latency is roughly the overhead plus one or two fsync times of your storage; measure yours with `pg_test_fsync` and this benchmark. The target means the engine overhead (confirmed by the user, 2026-11-12); durable latency is reported, not targeted.
