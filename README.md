@@ -7,7 +7,7 @@ interrupted run is resumed (or compensated) by whichever instance picks it up.
 River (in Postgres) drives recovery, retries, timers and signals; domain events
 go through a transactional outbox to BullMQ.
 
-Status: milestones M0 to M6 of [the plan](docs/PLAN.md) are implemented. See
+Status: milestones M0 to M8 of [the plan](docs/PLAN.md) are implemented. See
 [TASKS.md](TASKS.md) for the checklist and the known limitations.
 
 ## Usage
@@ -62,10 +62,12 @@ func main() {
 
 ## Documentation
 
+- **User guide**: [English](docs/guide/README.md) | [Tiếng Việt](docs/huong-dan/README.md): getting started, steps, workflows, runs, waiting, modules, events, testing, production, troubleshooting.
 - [Concepts](docs/concepts.md): runs, steps, keys, replay, compensation, parking.
 - [Guarantees and failure modes](docs/guarantees.md): what holds under crashes, partitions and redeploys.
 - [Operations](docs/operations.md): lifecycle, pool sizing, PgBouncer, timing, event bus, retention.
 - [Patterns](docs/patterns.md): long-running external work, payload size.
+- [Quickstart](examples/quickstart/main.go): the two-step transfer of the guide's first chapter.
 - [Example modulith](examples/modulith): three isolated modules, a checkout flow, HTTP API, multiple instances.
 
 ## Development

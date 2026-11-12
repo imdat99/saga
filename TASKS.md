@@ -122,6 +122,12 @@ Start: 69 allocs/op (`BenchmarkStepRun`). Breakdown per run: ~21 pgconn command 
 - [x] Round 6 - encode through a pointer when the type provably encodes the same (no pointer-receiver marshal method on the value or on anything reached through struct fields and arrays), uuid v7 without the reader allocation. 52 -> 40. Review: PASS (byte equality checked against the json/v2 source; extra cases tested: pointer root, omitzero with pointer `IsZero`, pointer `MarshalText` map keys)
 - [x] Verified: benchmarks (interleaved benchstat vs M7: 69 -> 40 allocs/op, -8.5% B/op, latency unchanged), full suite, `-count=10 . ./internal/store`, chaos, lint; one review per round focused on invariants (3 rounds, all PASS on the first review)
 
+## Docs - User guide
+
+- [x] Bilingual user guide: `docs/guide` (English, primary) and `docs/huong-dan` (Vietnamese, same structure): getting started, steps, workflows, runs, waiting, modules (`idem`), event bus, testing, production, troubleshooting
+- [x] `examples/quickstart`: the guide's first program, built and linted with the repository, run against docker compose Postgres (done, compensated, same-key replay)
+- [ ] Keep both languages in sync on every API change (rule recorded in the decision log)
+
 ## Known limitations (current)
 
 - Recovery needs at least one instance with `Engine.Start`; inline-only deployments resume abandoned runs only when called again with the same `idem_key`.
