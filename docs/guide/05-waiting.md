@@ -2,7 +2,7 @@
 
 ## Parking
 
-Whenever a run must wait (retry backoff, a timer, a signal, a busy lock, compensation backoff), the engine **parks** it: status `waiting`, lease released, no goroutine, no connection. A River job scheduled at a database time (or the signal) wakes it on any started instance, which resumes the workflow from the top with replay. A parked run costs one row in `saga.run` and one in `saga.river_job`, so millions of waiting runs are fine.
+Whenever a run must wait (retry backoff, a timer, a signal, a busy lock, compensation backoff), the engine **parks** it: status `waiting` (status `compensating` with no owner for a compensation backoff), lease released, no goroutine, no connection. A River job scheduled at a database time (or the signal) wakes it on any started instance, which resumes the workflow from the top with replay. A parked run costs one row in `saga.run`, plus one in `saga.river_job` when it has a wake-up time (an `Await` without timeout on a run without deadline has none: only the signal wakes it), so millions of waiting runs are fine.
 
 Inside the workflow, every waiting primitive returns an error wrapping `saga.ErrRunWaiting` the first time; return it as is. Outside, `Workflow.Run` returns `ErrRunWaiting`; use `Handle.Wait` for the outcome. Durable delays have about 5 seconds of granularity (River's scheduler).
 

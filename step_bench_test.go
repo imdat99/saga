@@ -61,7 +61,7 @@ func benchPool(b *testing.B, pool *pgxpool.Pool) *pgxpool.Pool {
 		cfg.ConnConfig.RuntimeParams["synchronous_commit"] = "off"
 	}
 	if n, err := strconv.Atoi(os.Getenv("SAGA_BENCH_MAX_CONNS")); err == nil && n > 0 {
-		cfg.MaxConns = int32(n) //nolint:gosec // small test setting
+		cfg.MaxConns = int32(n)
 	}
 	p, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {

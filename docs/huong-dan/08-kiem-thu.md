@@ -72,7 +72,7 @@ if !errors.As(err, &re) || re.Status != saga.StatusCompensated {
 Cho module lỗi tạm thời N lần (service payment trong modulith có `FailNext(n)`), chạy, rồi chờ kết quả. Retry làm run bị park, nên dùng handle và cho đủ thời gian (backoff làm tròn lên khoảng 5 s):
 
 ```go
-_, err := wf.Run(ctx, eng, key, in)
+out, err := wf.Run(ctx, eng, key, in)
 if errors.Is(err, saga.ErrRunWaiting) {
 	h, _ := wf.Lookup(ctx, eng, key)
 	waitCtx, cancel := context.WithTimeout(ctx, time.Minute)
@@ -88,8 +88,9 @@ Ngắt run giữa một step rồi tiếp tục với cùng key:
 ```go
 // 1. Một step bị chặn tới khi test cho đi tiếp, và đếm số lần chạy theo key.
 // 2. Chạy trong goroutine với ctx có thể huỷ; huỷ nó khi step đang bị chặn.
-// 3. Chạy lại với cùng key trên cùng engine hoặc engine khác (sau LeaseTTL,
-//    hoặc ngay sau eng.Stop, vì Stop nhả lease).
+// 3. Chạy lại với cùng key: trên cùng engine sau LeaseTTL, hoặc trên engine
+//    thứ hai ngay sau khi dừng engine đầu (Stop nhả lease; bản thân engine
+//    đã dừng trả ErrEngineStopped).
 // 4. Kiểm tra: step chạy lại với CÙNG key, các step đã xong không chạy lại,
 //    kết quả cuối đúng, module chỉ áp dụng hiệu ứng một lần.
 ```

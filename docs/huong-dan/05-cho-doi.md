@@ -2,7 +2,7 @@
 
 ## Park
 
-Mỗi khi run phải chờ (backoff của retry, timer, signal, lock bận, backoff của compensation), engine **park** nó: trạng thái `waiting`, nhả lease, không giữ goroutine hay connection. Một job River hẹn giờ theo giờ database (hoặc chính signal) đánh thức nó trên bất kỳ instance nào đã `Start`; instance đó chạy lại workflow từ đầu với replay. Một run đang park tốn một dòng trong `saga.run` và một dòng trong `saga.river_job`, nên hàng triệu run đang chờ vẫn ổn.
+Mỗi khi run phải chờ (backoff của retry, timer, signal, lock bận, backoff của compensation), engine **park** nó: trạng thái `waiting` (với backoff của compensation thì là `compensating` không có owner), nhả lease, không giữ goroutine hay connection. Một job River hẹn giờ theo giờ database (hoặc chính signal) đánh thức nó trên bất kỳ instance nào đã `Start`; instance đó chạy lại workflow từ đầu với replay. Một run đang park tốn một dòng trong `saga.run`, cộng một dòng trong `saga.river_job` khi có thời điểm thức dậy (`Await` không timeout trên run không có deadline thì không có: chỉ signal mới đánh thức nó), nên hàng triệu run đang chờ vẫn ổn.
 
 Bên trong workflow, mọi lệnh chờ trả lỗi bọc `saga.ErrRunWaiting` ở lần đầu; hãy trả nó nguyên vẹn. Bên ngoài, `Workflow.Run` trả `ErrRunWaiting`; dùng `Handle.Wait` để lấy kết quả. Các khoảng chờ bền vững có độ chính xác khoảng 5 giây (scheduler của River).
 

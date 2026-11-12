@@ -3,7 +3,7 @@
 ## What you need
 
 - Go 1.27 or later.
-- Postgres 14 or later (the repository tests on 16). The engine keeps everything there: runs, steps, signals, locks, and its job queue (River).
+- Postgres (the repository is tested on 16 only). The engine keeps everything there: runs, steps, signals, locks, and its job queue (River).
 - Redis 7 only if you use the event bus (chapter 7).
 
 ```bash
@@ -84,12 +84,15 @@ case errors.As(err, &re):
 	// re.Status is compensated or needs_attention, re.Cause says why
 case err != nil:
 	// infrastructure error, lease lost, cancelled: calling Run again with the same key continues the run
+	// (not for ErrIdemKeyConflict or ErrEngineStopped, see chapter 4)
 default:
 	// done: out is the output
 }
 ```
 
 ### 5. Try it
+
+The program connects to `SAGA_DSN`, by default the docker compose database (`postgres://saga:saga@localhost:5432/saga?sslmode=disable`).
 
 ```bash
 go run ./examples/quickstart              # transfer done: debit ..., credit ...

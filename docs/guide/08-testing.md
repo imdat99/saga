@@ -72,7 +72,7 @@ if !errors.As(err, &re) || re.Status != saga.StatusCompensated {
 Make the module fail transiently N times (the modulith's payment service has `FailNext(n)`), run, and wait for the outcome. Retries park the run, so use the handle and give it time (backoffs round up to about 5 s):
 
 ```go
-_, err := wf.Run(ctx, eng, key, in)
+out, err := wf.Run(ctx, eng, key, in)
 if errors.Is(err, saga.ErrRunWaiting) {
 	h, _ := wf.Lookup(ctx, eng, key)
 	waitCtx, cancel := context.WithTimeout(ctx, time.Minute)
@@ -88,8 +88,9 @@ Interrupt a run mid-step and resume it with the same key:
 ```go
 // 1. A step that blocks until the test lets it go, and counts executions by key.
 // 2. Run in a goroutine with a cancellable ctx; cancel it while the step blocks.
-// 3. Run again with the same key on the same or another engine (after LeaseTTL,
-//    or immediately after eng.Stop, which releases leases).
+// 3. Run again with the same key: on the same engine after LeaseTTL, or on a
+//    second engine immediately after stopping the first (Stop releases leases;
+//    a stopped engine itself returns ErrEngineStopped).
 // 4. Assert: the step ran again with the SAME key, completed steps did not
 //    re-run, the final outcome is correct, the module applied the effect once.
 ```

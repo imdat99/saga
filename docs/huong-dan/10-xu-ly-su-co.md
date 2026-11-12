@@ -18,8 +18,9 @@ SELECT id, status, wake_at, await_name, deadline, lease_until, owner_id
 FROM saga.run WHERE id = $1;
 ```
 
-- `await_name` có giá trị, `wake_at` NULL: đang chờ một signal chưa ai gửi. Kiểm tra bên gửi (`saga.signal` chứa các signal đã giao).
-- `wake_at` trong tương lai: đang chờ backoff của retry hoặc `Sleep`; khoảng chờ bền vững làm tròn lên khoảng 5 s.
+- `await_name` có giá trị: đang chờ signal đó (`saga.signal` chứa các signal đã giao tới giờ). Nếu `wake_at` NULL thì không có timeout và không có deadline: chỉ signal mới đánh thức nó; kiểm tra bên gửi.
+- `wake_at` trong tương lai: thời điểm sớm nhất trong những thứ nó chờ: backoff của retry, `Sleep`, timeout của `Await`, lần thử lại của `LockWait`, hoặc deadline của run (cột `deadline`). Khoảng chờ bền vững làm tròn lên khoảng 5 s.
+- Trạng thái `compensating`, `owner_id` NULL, `wake_at` có giá trị: đang backoff của compensation.
 - `wake_at` trong quá khứ: job resume lẽ ra phải chạy; kiểm tra River (`SELECT * FROM saga.river_job WHERE args->>'run_id' = $1`) và log của các instance.
 
 ### Run kẹt ở `running` mà không ai chạy
@@ -87,9 +88,10 @@ FROM saga.step WHERE run_id = $1 ORDER BY seq;
 -- Run theo idempotency key
 SELECT id, status FROM saga.run WHERE idem_key = $1;
 
--- Các run chờ lâu nhất
-SELECT id, workflow, wake_at, await_name FROM saga.run
-WHERE status = 'waiting' ORDER BY updated_at LIMIT 20;
+-- Các run đang park lâu nhất (waiting, hoặc compensating trong backoff)
+SELECT id, workflow, status, wake_at, await_name FROM saga.run
+WHERE status = 'waiting' OR (status = 'compensating' AND owner_id IS NULL AND wake_at IS NOT NULL)
+ORDER BY updated_at LIMIT 20;
 
 -- Step retry nhiều nhất
 SELECT name, count(*), max(attempt) FROM saga.step

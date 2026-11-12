@@ -18,8 +18,9 @@ SELECT id, status, wake_at, await_name, deadline, lease_until, owner_id
 FROM saga.run WHERE id = $1;
 ```
 
-- `await_name` set, `wake_at` NULL: waiting for a signal nobody sent. Check the sender (`saga.signal` holds delivered signals).
-- `wake_at` in the future: waiting for a retry backoff or `Sleep`; durable delays round up to about 5 s.
+- `await_name` set: waiting for that signal (`saga.signal` holds the signals delivered so far). With `wake_at` NULL there is no timeout and no deadline: only the signal wakes it; check the sender.
+- `wake_at` in the future: the earliest of what it waits for: a retry backoff, `Sleep`, an `Await` timeout, a `LockWait` retry, or the run deadline (`deadline` column). Durable delays round up to about 5 s.
+- Status `compensating`, `owner_id` NULL, `wake_at` set: a compensation backoff.
 - `wake_at` in the past: the resume job should run; check River (`SELECT * FROM saga.river_job WHERE args->>'run_id' = $1`) and the instances' logs.
 
 ### Run stuck in `running` with nobody executing it
@@ -87,9 +88,10 @@ FROM saga.step WHERE run_id = $1 ORDER BY seq;
 -- A run by idempotency key
 SELECT id, status FROM saga.run WHERE idem_key = $1;
 
--- Oldest waiting runs
-SELECT id, workflow, wake_at, await_name FROM saga.run
-WHERE status = 'waiting' ORDER BY updated_at LIMIT 20;
+-- Oldest parked runs (waiting, or compensating in a backoff)
+SELECT id, workflow, status, wake_at, await_name FROM saga.run
+WHERE status = 'waiting' OR (status = 'compensating' AND owner_id IS NULL AND wake_at IS NOT NULL)
+ORDER BY updated_at LIMIT 20;
 
 -- Steps retrying the most
 SELECT name, count(*), max(attempt) FROM saga.step

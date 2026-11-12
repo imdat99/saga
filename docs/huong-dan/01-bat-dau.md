@@ -3,7 +3,7 @@
 ## Cần có
 
 - Go 1.27 trở lên.
-- Postgres 14 trở lên (repository kiểm thử trên 16). Engine lưu mọi thứ ở đây: run, step, signal, lock và hàng đợi job (River).
+- Postgres (repository chỉ được kiểm thử trên bản 16). Engine lưu mọi thứ ở đây: run, step, signal, lock và hàng đợi job (River).
 - Redis 7, chỉ khi dùng event bus (chương 7).
 
 ```bash
@@ -84,12 +84,15 @@ case errors.As(err, &re):
 	// re.Status là compensated hoặc needs_attention, re.Cause cho biết lý do
 case err != nil:
 	// lỗi hạ tầng, mất lease, bị huỷ: gọi Run lại với cùng key sẽ tiếp tục run
+	// (không áp dụng cho ErrIdemKeyConflict hay ErrEngineStopped, xem chương 4)
 default:
 	// done: out là output
 }
 ```
 
 ### 5. Chạy thử
+
+Chương trình kết nối tới `SAGA_DSN`, mặc định là database của docker compose (`postgres://saga:saga@localhost:5432/saga?sslmode=disable`).
 
 ```bash
 go run ./examples/quickstart              # transfer done: debit ..., credit ...

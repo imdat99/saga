@@ -31,16 +31,22 @@ var CompleteOrder = saga.DefineWorkflow("order.complete", 1,
 
 ### 2. Trả lỗi của engine nguyên vẹn
 
-`Step.Run`, `Sleep`, `Await` và `Lock` có thể trả lỗi bọc `saga.ErrRunWaiting` (run đã park) hoặc lỗi huỷ (mất lease, shutdown). Hãy trả chúng ra nguyên vẹn: engine nhận ra và không compensate. Thực tế: `if err != nil { return zero, err }`. Nếu cần xem lỗi, dùng `errors.Is` và vẫn trả lỗi gốc.
+`Step.Run`, `Sleep`, `Await` và `Lock` có thể trả lỗi bọc `saga.ErrRunWaiting` (run đã park) hoặc lỗi huỷ (mất lease, shutdown). Hãy trả chúng ra nguyên vẹn: engine nhận ra và không compensate. Thực tế: `if err != nil { return zero, err }`.
+
+Không rẽ sang nhánh khác tuỳ theo **step trả về lỗi ứng dụng nào**. Step thất bại được replay từ bản ghi, bản ghi giữ lại thông điệp, các sentinel của engine (`ErrStepTimeout`, `ErrRunTimeout`, `ErrAwaitTimeout`, `ErrLockHeld`, `ErrLockLost`) và `saga.Permanent`, nhưng không giữ giá trị lỗi của bạn: `errors.Is(err, payment.ErrDeclined)` có thể đúng ở lần chạy đầu và sai khi replay, khiến run đi đường khác. Để rẽ nhánh theo kết quả nghiệp vụ, hãy đưa nó vào **output** của step thay vì trả lỗi:
 
 ```go
-_, err := Authorize.Run(c, in.Amount)
-switch {
-case err == nil:
-case errors.Is(err, payment.ErrDeclined): // lỗi nghiệp vụ vĩnh viễn, đã được ghi
-	return Order{}, err                      // compensate những gì đã làm
-default:
-	return Order{}, err                      // gồm cả ErrRunWaiting: trả nguyên vẹn
+// Step báo bị từ chối bằng dữ liệu, không bằng lỗi.
+res, err := ChargeCard.Run(c, in.Amount)  // res.Declined bool, res.Ref string
+if err != nil {
+	return Order{}, err                    // lỗi hạ tầng, ErrRunWaiting...: trả nguyên vẹn
+}
+if res.Declined {
+	_, err := NotifyDeclined.Run(c, in.CartID) // tất định: res được replay đúng như đã ghi
+	if err != nil {
+		return Order{}, err
+	}
+	return Order{}, saga.Permanent(errors.New("payment declined"))
 }
 ```
 

@@ -26,3 +26,16 @@ The reference documents stay short and precise; this guide explains how to use t
 10. [Troubleshooting](10-troubleshooting.md): symptoms, causes, fixes, and SQL to inspect runs.
 
 The program of chapter 1 is in [examples/quickstart](../../examples/quickstart/main.go); a complete application with three isolated modules, an HTTP API and several instances is in [examples/modulith](../../examples/modulith).
+
+## Glossary
+
+| Term | Meaning |
+| --- | --- |
+| run | One execution of a workflow for one idempotency key |
+| step | One unit of work with a side effect, optionally with a compensator |
+| key (`saga.Key`) | Idempotency key of one step invocation: `<runID>:<position>:<step name>` |
+| replay | Re-executing the workflow function from the top; completed steps return their recorded outputs |
+| compensate / compensator | Undo / the function undoing a step's effect |
+| lease | Temporary ownership of a run by one instance (owner + expiry + version) |
+| park | Suspend a run in Postgres, lease released, no goroutine held |
+| needs_attention | Terminal-until-fixed status that requires an operator |

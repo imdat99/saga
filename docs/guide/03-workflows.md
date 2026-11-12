@@ -31,16 +31,22 @@ var CompleteOrder = saga.DefineWorkflow("order.complete", 1,
 
 ### 2. Return engine errors as they are
 
-`Step.Run`, `Sleep`, `Await` and `Lock` may return an error wrapping `saga.ErrRunWaiting` (the run parked) or a cancellation (lease lost, shutdown). Return those unchanged: the engine recognises them and does not compensate. In practice: `if err != nil { return zero, err }`. If you inspect errors, test with `errors.Is` and still return the original error.
+`Step.Run`, `Sleep`, `Await` and `Lock` may return an error wrapping `saga.ErrRunWaiting` (the run parked) or a cancellation (lease lost, shutdown). Return those unchanged: the engine recognises them and does not compensate. In practice: `if err != nil { return zero, err }`.
+
+Do not take a different path depending on **which application error** a step returned. A failed step is replayed from its record, which keeps the message, the engine sentinels (`ErrStepTimeout`, `ErrRunTimeout`, `ErrAwaitTimeout`, `ErrLockHeld`, `ErrLockLost`) and `saga.Permanent`, but not your own error values: `errors.Is(err, payment.ErrDeclined)` can be true on the first execution and false on a replay, and the run would take another path. To branch on a business outcome, make it part of the step's **output** instead of an error:
 
 ```go
-_, err := Authorize.Run(c, in.Amount)
-switch {
-case err == nil:
-case errors.Is(err, payment.ErrDeclined): // permanent business failure, recorded
-	return Order{}, err                      // compensate what was done
-default:
-	return Order{}, err                      // includes ErrRunWaiting: return as is
+// The step reports a decline as data, not as an error.
+res, err := ChargeCard.Run(c, in.Amount)  // res.Declined bool, res.Ref string
+if err != nil {
+	return Order{}, err                    // infrastructure failure, ErrRunWaiting...: return as is
+}
+if res.Declined {
+	_, err := NotifyDeclined.Run(c, in.CartID) // deterministic: res is replayed as recorded
+	if err != nil {
+		return Order{}, err
+	}
+	return Order{}, saga.Permanent(errors.New("payment declined"))
 }
 ```
 
