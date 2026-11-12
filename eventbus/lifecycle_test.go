@@ -10,18 +10,17 @@ import (
 	"github.com/imdat99/saga/eventbus"
 )
 
-// Stop must not wait on a relay pass that itself waits on the bus.
+// Stop must not wait on a relay pass that itself waits.
 func TestStopDuringRelayPass(t *testing.T) {
 	t.Parallel()
-	pool, bus := newBus(t)
+	b := newTestBus(t)
 	rec := newRecorder()
-	if err := bus.Subscribe(eventbus.Subscriber{ID: "billing.invoice", Event: "order.created", Handle: rec.handler("b")}); err != nil {
-		t.Fatal(err)
-	}
+	start(t, b.consumer("billing", eventbus.Subscriber{ID: "invoice", Event: "order.created", Handle: rec.handler("b")}))
+	p := b.producer()
 	inPass := make(chan struct{})
 	release := make(chan struct{})
 	first := true
-	bus.SetAfterPush(func() error {
+	p.SetAfterPush(func() error {
 		if first {
 			first = false
 			close(inPass)
@@ -29,13 +28,13 @@ func TestStopDuringRelayPass(t *testing.T) {
 		}
 		return nil
 	})
-	emit(t, pool, bus, 1)
-	if err := bus.Start(context.Background()); err != nil {
+	emit(t, b, p, 1)
+	if err := p.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	<-inPass
 	stopped := make(chan error, 1)
-	go func() { stopped <- bus.Stop(context.Background()) }()
+	go func() { stopped <- p.Stop(context.Background()) }()
 	time.Sleep(100 * time.Millisecond) // Stop is now waiting for the pass
 	close(release)
 	select {
@@ -48,33 +47,35 @@ func TestStopDuringRelayPass(t *testing.T) {
 	}
 }
 
-func TestStartRejectsPartlyHandledQueue(t *testing.T) {
+// Start twice, Subscribe after Start.
+func TestStartTwice(t *testing.T) {
 	t.Parallel()
-	_, bus := newBus(t)
-	rec := newRecorder()
-	for _, s := range []eventbus.Subscriber{
-		{ID: "a", Event: "x", Queue: "shared", Handle: rec.handler("a")},
-		{ID: "b", Event: "x", Queue: "shared"},
-	} {
-		if err := bus.Subscribe(s); err != nil {
-			t.Fatal(err)
-		}
+	b := newTestBus(t)
+	p := b.producer()
+	start(t, p)
+	if err := p.Start(context.Background()); err == nil {
+		t.Fatal("producer started twice")
 	}
-	if err := bus.Start(context.Background()); err == nil {
-		_ = bus.Stop(context.Background())
-		t.Fatal("Start accepted a queue whose workers cannot handle every job")
+	c := b.consumer("svc", eventbus.Subscriber{ID: "h", Event: "x", Handle: newRecorder().handler("h")})
+	start(t, c)
+	if err := c.Start(context.Background()); err == nil {
+		t.Fatal("consumer started twice")
+	}
+	if err := c.Subscribe(eventbus.Subscriber{ID: "late", Event: "x", Handle: newRecorder().handler("late")}); err == nil {
+		t.Fatal("Subscribe accepted after Start")
 	}
 }
 
 // Retention keeps the staged events of runs still going, however old.
 func TestRetentionKeepsStagingOfLiveRuns(t *testing.T) {
 	t.Parallel()
-	pool, bus := newBus(t)
+	b := newTestBus(t)
+	p := b.producer()
 	ctx := context.Background()
-	if err := saga.Migrate(ctx, pool); err != nil {
+	if err := saga.Migrate(ctx, b.pool); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `
+	if _, err := b.pool.Exec(ctx, `
 		INSERT INTO saga.run (id, workflow, version, idem_key, status, input) VALUES
 			('00000000-0000-0000-0000-000000000001', 'w', 1, 'live', 'waiting', '{}'),
 			('00000000-0000-0000-0000-000000000002', 'w', 1, 'ended', 'compensated', '{}');
@@ -86,45 +87,44 @@ func TestRetentionKeepsStagingOfLiveRuns(t *testing.T) {
 			(gen_random_uuid(), 'e', '{}', now() - interval '30 days', NULL);`); err != nil {
 		t.Fatal(err)
 	}
-	if err := bus.Cleanup(ctx); err != nil {
+	if err := p.Cleanup(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if n := count(t, pool, `SELECT count(*) FROM eventbus.staging`); n != 1 {
+	if n := count(t, b.pool, `SELECT count(*) FROM eventbus.staging`); n != 1 {
 		t.Fatalf("staging rows = %d, want 1 (the live run's)", n)
 	}
-	if n := count(t, pool, `SELECT count(*) FROM eventbus.outbox`); n != 1 {
+	if n := count(t, b.pool, `SELECT count(*) FROM eventbus.outbox`); n != 1 {
 		t.Fatalf("outbox rows = %d, want 1 (the unsent one)", n)
 	}
 }
 
-// A job being processed while Stop runs must not deadlock it (the processor
-// used to take the bus mutex that Stop held).
+// A job being processed while Stop runs must not deadlock it.
 func TestStopWhileHandlerRuns(t *testing.T) {
 	t.Parallel()
-	pool, bus := newBus(t)
+	b := newTestBus(t)
 	inHandler := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	if err := bus.Subscribe(eventbus.Subscriber{
+	c := b.consumer("slow", eventbus.Subscriber{
 		ID: "slow", Event: "order.created",
 		Handle: func(ctx context.Context, ev eventbus.Event) error {
 			once.Do(func() { close(inHandler) })
 			<-release
 			return nil
 		},
-	}); err != nil {
+	})
+	if err := c.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := bus.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	emit(t, pool, bus, 1)
+	p := b.producer()
+	start(t, p)
+	emit(t, b, p, 1)
 	<-inHandler
 	stopped := make(chan error, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		stopped <- bus.Stop(ctx)
+		stopped <- c.Stop(ctx)
 	}()
 	time.Sleep(100 * time.Millisecond)
 	close(release)

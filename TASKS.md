@@ -17,6 +17,7 @@ Legend: `[x]` done, `[~]` in progress, `[ ]` todo. Update this file in the same 
 | M6 | Example modulith, e2e, benchmarks, observability | Done |
 | M7 | GC and allocation diet of the hot path | Done |
 | M8 | Allocation diet, second pass | Done |
+| M9 | Event bus for several services: consumer groups, Redis registry, producer/consumer split | In progress |
 
 ## M0 - Skeleton
 
@@ -121,6 +122,19 @@ Start: 69 allocs/op (`BenchmarkStepRun`). Breakdown per run: ~21 pgconn command 
 - [x] Round 5 - context watch folded into the heartbeat entry: fired by the heartbeat's own cancellations and, only when the caller's context can be cancelled, by an AfterFunc on it; statements run on `context.Background()`; covered contexts matched by identity. 61 -> 52. Review: PASS (caller's cause set before Fire, AfterFunc registered outside the heartbeat lock, `end` deferred; tests for caller cancel, caller cause, shutdown and lease loss mid-statement, mutation-checked)
 - [x] Round 6 - encode through a pointer when the type provably encodes the same (no pointer-receiver marshal method on the value or on anything reached through struct fields and arrays), uuid v7 without the reader allocation. 52 -> 40. Review: PASS (byte equality checked against the json/v2 source; extra cases tested: pointer root, omitzero with pointer `IsZero`, pointer `MarshalText` map keys)
 - [x] Verified: benchmarks (interleaved benchstat vs M7: 69 -> 40 allocs/op, -8.5% B/op, latency unchanged), full suite, `-count=10 . ./internal/store`, chaos, lint; one review per round focused on invariants (3 rounds, all PASS on the first review)
+
+## M9 - Event bus for several services
+
+Bug (found by the user, reproduced by `TestSubscriberInAnotherService`: 20 of 40 deliveries lost): a relay fanned events out only to the subscribers registered in its own process, so a subscriber of another service (or another instance with a different subscriber set) missed every event relayed elsewhere, and a service could not subscribe without a Postgres pool (every Bus ran the relay). Tests only ever ran publisher and subscribers in one Bus. Design after reading Medusa's event-bus-redis (one queue, job per event, worker runs all local subscribers, completedSubscriberIds on retry, server/worker modes), keeping our transactional outbox and staging.
+
+- [ ] Consumer groups: one BullMQ queue per group (a service), one job per (event, group), job id `<eventID>.<group>`; the group's workers run every local handler of the event, recording completed subscribers in the job data so a retry skips them (Medusa); a handler returning `Unrecoverable` is given up without failing the others
+- [ ] Registry in Redis: `routes` (event -> groups, union across the group's instances) and `groups` (retry policy), with a version counter so relays reload only on change; `Unregister(group)`, `Forget(group, event)`
+- [ ] Split: `NewProducer(pool, opts)` (EmitTx, RunEnded, relay, retention) and `NewConsumer(group, opts)` (Subscribe, workers; Redis only, no Postgres); `Bus` removed (breaking, `feat!`)
+- [ ] Rolling deploy: an event routed to the group but without a local handler on this instance fails retryably (another instance takes the retry)
+- [ ] Performance: each event encoded once per pass (JSON built by Postgres, shared by every group's job), job options precomputed per group, one options slice per pass; relay and consumer benchmarks with allocation budgets in CI
+- [ ] Tests written first: two services both receive every event with two relaying producers, consumer without Postgres, partial retry, rolling deploy, unrecoverable handler, registry change picked up, unregister/forget, plus the existing lifecycle, crash-after-push and saga tests ported
+- [ ] Docs: guide chapter 7 (both languages), operations, README, decision log, known limitations; modulith example ported
+- [ ] Verified: race tests, `-count=10`, chaos, lint, benchmarks; reviewed by a subagent
 
 ## Docs - User guide
 

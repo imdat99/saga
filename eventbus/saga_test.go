@@ -18,7 +18,7 @@ type order struct{ ID int }
 
 // orderSaga creates an order in a module transaction that emits
 // "order.created" (staged, since it runs inside a step), then charges.
-func orderSaga(t *testing.T, pool *pgxpool.Pool, bus *eventbus.Bus, chargeErr error, refundErr error) *saga.Workflow[order, order] {
+func orderSaga(t *testing.T, pool *pgxpool.Pool, bus *eventbus.Producer, chargeErr error, refundErr error) *saga.Workflow[order, order] {
 	t.Helper()
 	create := saga.DefineStep(testdb.UniqueName(t, "order.create"),
 		func(ctx context.Context, k saga.Key, o order) (order, int, error) {
@@ -44,24 +44,20 @@ func orderSaga(t *testing.T, pool *pgxpool.Pool, bus *eventbus.Bus, chargeErr er
 	})
 }
 
-func sagaSetup(t *testing.T) (*pgxpool.Pool, *eventbus.Bus, *saga.Engine, *recorder) {
+func sagaSetup(t *testing.T) (*pgxpool.Pool, *eventbus.Producer, *saga.Engine, *recorder) {
 	t.Helper()
-	pool, bus := newBus(t)
-	if err := saga.Migrate(context.Background(), pool); err != nil {
+	b := newTestBus(t)
+	if err := saga.Migrate(context.Background(), b.pool); err != nil {
 		t.Fatal(err)
 	}
 	rec := newRecorder()
-	for _, s := range []eventbus.Subscriber{
-		{ID: "billing.invoice", Event: "order.created", Handle: rec.handler("billing")},
-		{ID: "mail.confirm", Event: "order.created", Handle: rec.handler("mail")},
-		{ID: "ops.page", Event: eventbus.NeedsAttentionEvent, Handle: rec.handler("ops")},
-	} {
-		if err := bus.Subscribe(s); err != nil {
-			t.Fatal(err)
-		}
-	}
-	start(t, bus)
-	eng, err := saga.New(pool, saga.Options{Hooks: []saga.RunHook{bus}})
+	start(t, b.consumer("shop",
+		eventbus.Subscriber{ID: "billing.invoice", Event: "order.created", Handle: rec.handler("billing")},
+		eventbus.Subscriber{ID: "mail.confirm", Event: "order.created", Handle: rec.handler("mail")}))
+	start(t, b.consumer("ops", eventbus.Subscriber{ID: "page", Event: eventbus.NeedsAttentionEvent, Handle: rec.handler("ops")}))
+	p := b.producer()
+	start(t, p)
+	eng, err := saga.New(b.pool, saga.Options{Hooks: []saga.RunHook{p}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +66,7 @@ func sagaSetup(t *testing.T) (*pgxpool.Pool, *eventbus.Bus, *saga.Engine, *recor
 		defer cancel()
 		_ = eng.Stop(ctx)
 	})
-	return pool, bus, eng, rec
+	return b.pool, p, eng, rec
 }
 
 func count(t *testing.T, pool *pgxpool.Pool, q string) int {
