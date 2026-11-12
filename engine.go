@@ -325,7 +325,7 @@ func (e *Engine) run(ctx context.Context, req runRequest) (json.RawMessage, erro
 	if inserted {
 		run.LeaseVersion = 1
 		run.Deadline = deadline
-		return e.execute(ctx, run, acquired)
+		return e.execute(ctx, run, acquired, true)
 	}
 
 	existing, err := e.st.GetRunByIdemKey(ctx, idemKey)
@@ -363,7 +363,7 @@ func (e *Engine) run(ctx context.Context, req runRequest) (json.RawMessage, erro
 		}
 		return nil, ErrRunInProgress
 	}
-	return e.execute(ctx, leased, acquired)
+	return e.execute(ctx, leased, acquired, false)
 }
 
 // result returns the outcome of a run that already reached a terminal status.
@@ -386,11 +386,17 @@ func parked(r store.Run) bool {
 		(r.Status == store.RunCompensating && r.OwnerID == "" && r.WakeAt != nil)
 }
 
+// runLog returns the logger of a run. Built on demand: only error and
+// shutdown paths log, and With allocates even when the handler discards.
+func (e *Engine) runLog(run *store.Run) *slog.Logger {
+	return e.log.With("run", run.ID, "workflow", run.Workflow)
+}
+
 // execute runs (or resumes) a run the caller holds the lease for. run must be
 // the row as of the acquisition; acquired is the local time just before it.
-func (e *Engine) execute(ctx context.Context, run store.Run, acquired time.Time) (json.RawMessage, error) {
+// fresh means the caller just inserted the run: it has no history to load.
+func (e *Engine) execute(ctx context.Context, run store.Run, acquired time.Time, fresh bool) (json.RawMessage, error) {
 	lease := store.Lease{RunID: run.ID, Owner: e.opts.InstanceID, Version: run.LeaseVersion}
-	log := e.log.With("run", run.ID, "workflow", run.Workflow)
 
 	// A run started from inside another run's step must not look like part
 	// of it to its own compensators and hooks (RunIDFrom): hide the parent.
@@ -401,16 +407,24 @@ func (e *Engine) execute(ctx context.Context, run store.Run, acquired time.Time)
 			// Hand the run over now instead of after the TTL.
 			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.opts.ShutdownGrace)
 			if err := e.st.ReleaseLease(rctx, lease); err != nil {
-				log.Warn("release lease on shutdown", "err", err)
+				e.runLog(&run).Warn("release lease on shutdown", "err", err)
 			}
 			cancel()
 		}
 		untrack()
 	}()
+	// One context watch for all checkpoints of this execution. Deferred
+	// after untrack so it is stopped first: untrack cancels ctx, which would
+	// otherwise run the watch's callback in a new goroutine.
+	lease.Interrupt = e.st.NewInterrupt(ctx)
+	defer lease.Interrupt.Stop()
 
-	history, err := e.st.ListSteps(ctx, run.ID)
-	if err != nil {
-		return nil, interruption(ctx, err)
+	var history []store.Step // empty for a fresh run
+	if !fresh {
+		var err error
+		if history, err = e.st.ListSteps(ctx, run.ID); err != nil {
+			return nil, interruption(ctx, err)
+		}
 	}
 
 	if run.Status == store.RunCompensating {
@@ -422,9 +436,12 @@ func (e *Engine) execute(ctx context.Context, run store.Run, acquired time.Time)
 		return nil, fmt.Errorf("%w: %s", ErrWorkflowNotRegistered, workflowKey(run.Workflow, run.Version))
 	}
 
-	rc := &runCtx{Context: ctx, eng: e, run: run, lease: lease, steps: make(map[int]store.Step, len(history))}
-	for _, st := range history {
-		rc.steps[st.Seq] = st
+	rc := &runCtx{Context: ctx, eng: e, run: run, lease: lease}
+	if len(history) > 0 { // a nil map reads as empty: nothing to allocate for a new run
+		rc.steps = make(map[int]store.Step, len(history))
+		for _, st := range history {
+			rc.steps[st.Seq] = st
+		}
 	}
 
 	out, fnErr := runner(rc, run.Input)
@@ -434,10 +451,8 @@ func (e *Engine) execute(ctx context.Context, run store.Run, acquired time.Time)
 			return nil, waiting(run.ID)
 		}
 		if errors.Is(rc.fatal, ErrNonDeterministic) {
-			log.Error("parking run", "err", rc.fatal)
-			if err := e.st.Fenced(ctx, lease, func(tx pgx.Tx) error {
-				return e.finish(ctx, tx, run, store.RunNeedsAttention, nil, rc.fatal.Error())
-			}); err != nil {
+			e.runLog(&run).Error("parking run", "err", rc.fatal)
+			if err := e.finishRun(ctx, run, lease, store.RunNeedsAttention, nil, rc.fatal.Error()); err != nil {
 				return nil, interruption(ctx, err)
 			}
 			e.ended(run, store.RunNeedsAttention, rc.fatal.Error())
@@ -445,27 +460,25 @@ func (e *Engine) execute(ctx context.Context, run store.Run, acquired time.Time)
 		}
 		// Lease lost, cancelled or storage failure: stop here. Whoever owns
 		// the run next (this caller retrying, or recovery) continues it.
-		log.Warn("run interrupted", "err", rc.fatal)
+		e.runLog(&run).Warn("run interrupted", "err", rc.fatal)
 		return nil, rc.fatal
 	}
 
 	if fnErr == nil {
-		if err := e.st.Fenced(ctx, lease, func(tx pgx.Tx) error {
-			return e.finish(ctx, tx, run, store.RunDone, out, "")
-		}); err != nil {
+		if err := e.finishRun(ctx, run, lease, store.RunDone, out, ""); err != nil {
 			return nil, interruption(ctx, err)
 		}
 		e.ended(run, store.RunDone, "")
 		return out, nil
 	}
 
-	log.Info("workflow failed, compensating", "err", fnErr)
+	e.runLog(&run).Info("workflow failed, compensating", "err", fnErr)
 	if err := e.st.Fenced(ctx, lease, func(tx pgx.Tx) error {
 		return store.SetRunStatus(ctx, tx, run.ID, store.RunCompensating, nil, fnErr.Error())
 	}); err != nil {
 		return nil, interruption(ctx, err)
 	}
-	history, err = e.st.ListSteps(ctx, run.ID)
+	history, err := e.st.ListSteps(ctx, run.ID)
 	if err != nil {
 		return nil, interruption(ctx, err)
 	}
@@ -522,9 +535,7 @@ func (e *Engine) compensate(
 		return e.compensationFailed(ctx, run, lease, compFailure{step: st, policy: comp.policy, err: err, cause: cause})
 	}
 
-	if err := e.st.Fenced(ctx, lease, func(tx pgx.Tx) error {
-		return e.finish(ctx, tx, run, store.RunCompensated, nil, cause)
-	}); err != nil {
+	if err := e.finishRun(ctx, run, lease, store.RunCompensated, nil, cause); err != nil {
 		return nil, interruption(ctx, err)
 	}
 	e.ended(run, store.RunCompensated, cause)
@@ -580,6 +591,25 @@ func (e *Engine) compensationFailed(
 	e.log.Warn("compensation failed, retry scheduled", "run", run.ID, "step", st.Name,
 		"attempt", attempts, "err", compErr)
 	return nil, waiting(run.ID)
+}
+
+// finishRun records a terminal status under the lease. Without hooks it is
+// one fenced statement (one round trip instead of five: begin, lease check,
+// lock release, status, commit); hooks need the transaction.
+func (e *Engine) finishRun(
+	ctx context.Context,
+	run store.Run,
+	lease store.Lease,
+	status string,
+	out json.RawMessage,
+	errMsg string,
+) error {
+	if len(e.opts.Hooks) == 0 {
+		return e.st.FinishRunFenced(ctx, lease, status, out, errMsg)
+	}
+	return e.st.Fenced(ctx, lease, func(tx pgx.Tx) error {
+		return e.finish(ctx, tx, run, status, out, errMsg)
+	})
 }
 
 // finish records a terminal status inside tx and runs the RunHooks there, so

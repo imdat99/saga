@@ -161,7 +161,7 @@ func (e *Engine) resume(ctx context.Context, runID string) error {
 		// job). Whoever holds it, or its own wake-up job, carries on.
 		return nil
 	}
-	_, err = e.execute(ctx, leased, acquired)
+	_, err = e.execute(ctx, leased, acquired, false)
 	var re *RunError
 	switch {
 	case err == nil, errors.As(err, &re), errors.Is(err, ErrLeaseLost), errors.Is(err, ErrShutdown),

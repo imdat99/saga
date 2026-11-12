@@ -1,9 +1,13 @@
 package saga
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/imdat99/saga/internal/store"
@@ -39,6 +43,25 @@ type runCtx struct {
 	steps map[int]store.Step // history, by seq
 	seq   int
 	fatal error // lease lost, DB failure or non-determinism: stop, do not compensate
+	// jbuf is scratch for encoding step results (see appendJSON).
+	jbuf bytes.Buffer
+}
+
+// jsonV1 makes encoding/json/v2 produce exactly what encoding/json.Marshal
+// does (the encoding persisted so far).
+var jsonV1 = json.DefaultOptionsV1()
+
+// appendJSON encodes v after the content of c.jbuf and returns its bytes,
+// valid until c.jbuf is reset. Unlike json.Marshal it does not copy the
+// result out of the encoder's buffer: one allocation less per step. Earlier
+// slices stay valid when the buffer grows (it moves, the old bytes are kept).
+func (c *runCtx) appendJSON(v any) (json.RawMessage, error) {
+	start := c.jbuf.Len()
+	if err := jsonv2.MarshalWrite(&c.jbuf, v, jsonV1); err != nil {
+		return nil, err
+	}
+	b := c.jbuf.Bytes()
+	return b[start:len(b):len(b)], nil
 }
 
 func (c *runCtx) RunID() string { return c.run.ID }
@@ -162,8 +185,16 @@ func (c *runCtx) setFatal(err error) error {
 	return c.fatal
 }
 
+// stepKey builds the key in a stack buffer: one allocation (the string)
+// instead of the three of fmt.Sprintf, on every step.
 func stepKey(runID string, seq int, name string) Key {
-	return Key(fmt.Sprintf("%s:%d:%s", runID, seq, name))
+	var buf [128]byte
+	b := append(buf[:0], runID...)
+	b = append(b, ':')
+	b = strconv.AppendInt(b, int64(seq), 10)
+	b = append(b, ':')
+	b = append(b, name...)
+	return Key(b)
 }
 
 // RunIDFrom returns the id of the saga run ctx belongs to, if any. Modules use
@@ -185,6 +216,10 @@ type uncertainKey struct{}
 // value when no attempt recorded success; otherwise it is the data of the
 // successful attempt. Either way the compensator must look up what (if
 // anything) was done under its Key, e.g. with idem.Abort.
+//
+// A step defined without a compensator records no compensation data. If a
+// later deploy adds one, it sees the steps recorded before as uncertain, with
+// the zero value as data.
 func CompensationUncertain(ctx context.Context) bool {
 	v, _ := ctx.Value(uncertainKey{}).(bool)
 	return v

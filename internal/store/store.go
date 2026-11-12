@@ -91,6 +91,9 @@ type Lease struct {
 	RunID   string
 	Owner   string
 	Version int64
+	// Interrupt, if set, watches the execution's context for the fast-path
+	// statements made under this lease (see Interrupt).
+	Interrupt *Interrupt
 }
 
 // micros converts d for SQL as "$n * interval '1 microsecond'". A Duration's
@@ -100,10 +103,11 @@ func micros(d time.Duration) int64 { return d.Microseconds() }
 // Store runs queries against the saga schema.
 type Store struct {
 	pool *pgxpool.Pool
+	fast bool // hot-path statements on pgconn directly (see fast.go)
 }
 
 // New returns a Store backed by pool.
-func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool, fast: fastPathEnabled(pool)} }
 
 const runColumns = `id::text, workflow, version, idem_key, status, input, output, coalesce(error, ''), lease_version,
 	coalesce(await_name, ''), deadline, wake_at, coalesce(owner_id, '')`
@@ -125,15 +129,12 @@ func (s *Store) InsertRun(
 	ttl,
 	timeout time.Duration,
 ) (bool, *time.Time, error) {
-	var now time.Time
+	if s.fast {
+		return s.insertRunFast(ctx, r, owner, ttl, timeout)
+	}
 	var deadline *time.Time
-	err := s.pool.QueryRow(ctx, `
-		INSERT INTO saga.run (id, workflow, version, idem_key, status, input, owner_id, lease_until, lease_version, deadline)
-		VALUES ($1, $2, $3, $4, 'running', $5, $6, now() + $7 * interval '1 microsecond', 1,
-		        CASE WHEN $8::bigint > 0 THEN now() + $8::bigint * interval '1 microsecond' END)
-		ON CONFLICT (idem_key) DO NOTHING
-		RETURNING now(), deadline`,
-		r.ID, r.Workflow, r.Version, r.IdemKey, r.Input, owner, micros(ttl), micros(timeout)).Scan(&now, &deadline)
+	err := s.pool.QueryRow(ctx, insertRunStmt.sql,
+		r.ID, r.Workflow, r.Version, r.IdemKey, r.Input, owner, micros(ttl), micros(timeout)).Scan(&deadline)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil, nil
 	}
@@ -141,6 +142,39 @@ func (s *Store) InsertRun(
 		return false, nil, fmt.Errorf("insert run: %w", err)
 	}
 	return true, deadline, nil
+}
+
+var insertRunStmt = fastStmt{name: "saga_insert_run_v1", sql: `
+	INSERT INTO saga.run (id, workflow, version, idem_key, status, input, owner_id, lease_until, lease_version, deadline)
+	VALUES ($1, $2, $3, $4, 'running', $5, $6, now() + $7::bigint * interval '1 microsecond', 1,
+	        CASE WHEN $8::bigint > 0 THEN now() + $8::bigint * interval '1 microsecond' END)
+	ON CONFLICT (idem_key) DO NOTHING
+	RETURNING deadline`}
+
+func (s *Store) insertRunFast(ctx context.Context, r Run, owner string, ttl, timeout time.Duration) (bool, *time.Time, error) {
+	p := getParams()
+	defer p.release()
+	p.text(r.ID)
+	p.text(r.Workflow)
+	p.int(int64(r.Version))
+	p.text(r.IdemKey)
+	p.json(r.Input)
+	p.text(owner)
+	p.int(micros(ttl))
+	p.int(micros(timeout))
+	var deadline *time.Time
+	n, err := s.query(ctx, nil, &insertRunStmt, p, func(v [][]byte) error {
+		if v[0] == nil {
+			return nil
+		}
+		t, err := decodeTimestamptz(v[0])
+		deadline = &t
+		return err
+	})
+	if err != nil {
+		return false, nil, fmt.Errorf("insert run: %w", err)
+	}
+	return n == 1, deadline, nil
 }
 
 // GetRunByIdemKey loads a run by its idempotency key.
@@ -325,6 +359,69 @@ func SetRunStatus(ctx context.Context, tx pgx.Tx, runID, status string, output j
 	}
 	return nil
 }
+
+// FinishRunFenced is Fenced + SetRunStatus for a terminal status in one
+// autocommit statement: the CTE locks the run row and checks the lease (as
+// StartStepFenced), releases the business locks for done and compensated,
+// and the UPDATE records the status. ErrLeaseLost if the lease moved on.
+func (s *Store) FinishRunFenced(ctx context.Context, l Lease, status string, output json.RawMessage, errMsg string) error {
+	if status != RunDone && status != RunCompensated && status != RunNeedsAttention {
+		return fmt.Errorf("finish run: %q is not a terminal status", status)
+	}
+	if s.fast {
+		return s.finishRunFast(ctx, l, status, output, errMsg)
+	}
+	var one int
+	err := s.pool.QueryRow(ctx, finishRunStmt.sql, l.RunID, l.Owner, l.Version, status, output, errMsg).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrLeaseLost
+	}
+	if err != nil {
+		return fmt.Errorf("finish run: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) finishRunFast(ctx context.Context, l Lease, status string, output json.RawMessage, errMsg string) error {
+	p := getParams()
+	defer p.release()
+	p.text(l.RunID)
+	p.text(l.Owner)
+	p.int(l.Version)
+	p.text(status)
+	p.json(output)
+	p.text(errMsg)
+	n, err := s.query(ctx, l.Interrupt, &finishRunStmt, p, nil)
+	if err != nil {
+		return fmt.Errorf("finish run: %w", err)
+	}
+	if n == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// finishRunStmt: same effect as SetRunStatus with a terminal status. The
+// lock rows are deleted only once the lease CTE matched (run_id = NULL
+// matches nothing).
+var finishRunStmt = fastStmt{name: "saga_finish_run_v1", sql: `
+	WITH lease AS (
+		SELECT id FROM saga.run
+		WHERE id = $1 AND owner_id = $2 AND lease_version = $3
+		FOR NO KEY UPDATE
+	), unlocked AS (
+		DELETE FROM saga.lock
+		WHERE run_id = (SELECT id FROM lease) AND $4::text IN ('done', 'compensated')
+	)
+	UPDATE saga.run r
+	SET status = $4::text,
+	    output = coalesce($5::jsonb, r.output),
+	    error = coalesce(nullif($6::text, ''), r.error),
+	    owner_id = NULL, lease_until = NULL, wake_at = NULL, await_name = NULL,
+	    updated_at = now()
+	FROM lease
+	WHERE r.id = lease.id
+	RETURNING 1`}
 
 // RenewLeases extends the leases owner still holds, and the business locks of
 // those runs, in one statement. ids and
@@ -648,6 +745,9 @@ func (s *Store) PurgeRuns(ctx context.Context, age time.Duration, limit int) (in
 // durable commit on the server, such as the module's own transaction or the
 // step's done checkpoint, flushes it too.
 func (s *Store) StartStepFenced(ctx context.Context, l Lease, seq int, name string, async bool) (int, time.Time, error) {
+	if s.fast {
+		return s.startStepFast(ctx, l, seq, name, async)
+	}
 	var attempt int
 	var now time.Time
 	err := s.pool.QueryRow(ctx, startStepFencedSQL, l.RunID, seq, name, l.Owner, l.Version, async).Scan(&attempt, &now)
@@ -656,6 +756,39 @@ func (s *Store) StartStepFenced(ctx context.Context, l Lease, seq int, name stri
 	}
 	if err != nil {
 		return 0, now, fmt.Errorf("start step: %w", err)
+	}
+	return attempt, now, nil
+}
+
+var startStepStmt = fastStmt{name: "saga_start_step_v1", sql: startStepFencedSQL}
+
+// startStepFast is StartStepFenced on the fast path. Kept apart so its
+// locals do not escape through the pgx Scan of the regular path.
+func (s *Store) startStepFast(ctx context.Context, l Lease, seq int, name string, async bool) (int, time.Time, error) {
+	p := getParams()
+	defer p.release()
+	p.text(l.RunID)
+	p.int(int64(seq))
+	p.text(name)
+	p.text(l.Owner)
+	p.int(l.Version)
+	p.bool(async)
+	var attempt int
+	var now time.Time
+	n, err := s.query(ctx, l.Interrupt, &startStepStmt, p, func(v [][]byte) error {
+		a, err := decodeInt(v[0])
+		if err != nil {
+			return err
+		}
+		attempt = int(a)
+		now, err = decodeTimestamptz(v[1])
+		return err
+	})
+	if err != nil {
+		return 0, now, fmt.Errorf("start step: %w", err)
+	}
+	if n == 0 {
+		return 0, now, ErrLeaseLost
 	}
 	return attempt, now, nil
 }
@@ -683,22 +816,31 @@ const startStepFencedSQL = `
 // missing (lost with Options.AsyncStepStart after a Postgres crash), it is
 // recreated instead of the write being mistaken for a lost lease.
 func (s *Store) FinishStepFenced(ctx context.Context, l Lease, seq int, name string, o Outcome) error {
+	if s.fast {
+		p := getParams()
+		defer p.release()
+		p.text(l.RunID)
+		p.int(int64(seq))
+		p.text(o.Status)
+		p.json(o.Output)
+		p.json(o.CompData)
+		p.text(o.Error)
+		p.text(o.ErrorKind)
+		p.bool(o.Uncertain)
+		p.text(l.Owner)
+		p.int(l.Version)
+		p.text(name)
+		n, err := s.query(ctx, l.Interrupt, &finishStepStmt, p, nil)
+		if err != nil {
+			return fmt.Errorf("finish step: %w", err)
+		}
+		if n == 0 {
+			return ErrLeaseLost
+		}
+		return nil
+	}
 	var one int
-	err := s.pool.QueryRow(ctx, `
-		WITH lease AS (
-			SELECT id FROM saga.run
-			WHERE id = $1 AND owner_id = $9 AND lease_version = $10
-			FOR NO KEY UPDATE
-		)
-		INSERT INTO saga.step AS st (run_id, seq, name, status, output, comp_data, error, error_kind, uncertain, finished_at)
-		SELECT id, $2, $11, $3, $4, $5, nullif($6, ''), nullif($7, ''), $8,
-		       CASE WHEN $3 = 'retrying' THEN NULL ELSE now() END
-		FROM lease
-		ON CONFLICT (run_id, seq) DO UPDATE
-		SET status = excluded.status, output = excluded.output, comp_data = excluded.comp_data,
-		    error = excluded.error, error_kind = excluded.error_kind,
-		    uncertain = st.uncertain OR excluded.uncertain, finished_at = excluded.finished_at
-		RETURNING 1`,
+	err := s.pool.QueryRow(ctx, finishStepStmt.sql,
 		l.RunID, seq, o.Status, o.Output, o.CompData, o.Error, o.ErrorKind, o.Uncertain,
 		l.Owner, l.Version, name).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -709,3 +851,19 @@ func (s *Store) FinishStepFenced(ctx context.Context, l Lease, seq int, name str
 	}
 	return nil
 }
+
+var finishStepStmt = fastStmt{name: "saga_finish_step_v1", sql: `
+	WITH lease AS (
+		SELECT id FROM saga.run
+		WHERE id = $1 AND owner_id = $9 AND lease_version = $10
+		FOR NO KEY UPDATE
+	)
+	INSERT INTO saga.step AS st (run_id, seq, name, status, output, comp_data, error, error_kind, uncertain, finished_at)
+	SELECT id, $2, $11, $3, $4, $5, nullif($6, ''), nullif($7, ''), $8,
+	       CASE WHEN $3 = 'retrying' THEN NULL ELSE now() END
+	FROM lease
+	ON CONFLICT (run_id, seq) DO UPDATE
+	SET status = excluded.status, output = excluded.output, comp_data = excluded.comp_data,
+	    error = excluded.error, error_kind = excluded.error_kind,
+	    uncertain = st.uncertain OR excluded.uncertain, finished_at = excluded.finished_at
+	RETURNING 1`}

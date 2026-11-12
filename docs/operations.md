@@ -64,6 +64,13 @@ River keeps a `LISTEN` connection and uses session-level advisory locks during m
 
 `Migrate` needs a pool of at least 3 connections (lock holder, goose locker, statements). It also takes session-level advisory locks (goose and River migrations); run it over a direct connection.
 
+## Hot-path statements and pgx settings
+
+The step checkpoints, the run insert and the end-of-run statement bypass pgx's `Query`/`Scan` layer to save allocations: they run on `pgconn` as named prepared statements (`saga_*_v1`, prepared once per connection). This fast path is used only when the pool is in `pgx.QueryExecModeCacheStatement` (the default) and has no `ConnConfig.Tracer`; otherwise the same SQL goes through pgx (about twice the allocations per step), so a tracer still sees every statement. On the fast path:
+
+- a cancelled run context interrupts a statement in flight by setting a past deadline on its connection, like pgconn's default `DeadlineContextWatcherHandler`; a custom `BuildContextWatcherHandler` (e.g. sending a cancel request) is not used for these statements;
+- a prepared statement invalidated behind the engine's back (`DEALLOCATE`, a schema change: SQLSTATE 26000 or 0A000) fails one call and closes that connection; the next one prepares it again.
+
 ## Schema
 
 All engine tables live in the `saga` schema, including River's (`saga.river_job`, ...). An application using River for its own jobs keeps its own River tables in its own schema and is not affected by saga migrations.

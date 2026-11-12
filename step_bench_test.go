@@ -147,6 +147,7 @@ func BenchmarkRunsThreeInstances(b *testing.B) {
 	var next atomic.Int64
 	b.ResetTimer() // exclude database and engine setup
 	start := time.Now()
+	b.ReportAllocs()
 	b.SetParallelism(4) // 4 x GOMAXPROCS concurrent callers
 	b.RunParallel(func(pb *testing.PB) {
 		ctx := context.Background()

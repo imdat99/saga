@@ -303,7 +303,7 @@ func TestConcurrentRunsSameKeyExecuteOnce(t *testing.T) {
 
 	const callers = 8
 	var wg sync.WaitGroup
-	var ok, inProgress atomic.Int32
+	var ok, inProgress, failed atomic.Int32
 	for i := range callers {
 		wg.Add(1)
 		go func(e *saga.Engine) {
@@ -315,11 +315,16 @@ func TestConcurrentRunsSameKeyExecuteOnce(t *testing.T) {
 			case errors.Is(err, saga.ErrRunInProgress):
 				inProgress.Add(1)
 			default:
+				failed.Add(1)
 				t.Errorf("unexpected err: %v", err)
 			}
 		}(engines[i%2])
 	}
-	time.Sleep(200 * time.Millisecond)
+	// Release the step once every other caller has been turned away (a
+	// fixed sleep was flaky under load: a late caller found the run done).
+	for deadline := time.Now().Add(30 * time.Second); inProgress.Load()+failed.Load() < callers-1 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
 	close(gate)
 	wg.Wait()
 
@@ -463,5 +468,48 @@ func TestNestedRunIsolatesRunID(t *testing.T) {
 	want := []string{"step:" + innerID, "comp::false"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("run ids seen = %v, want %v", got, want)
+	}
+}
+
+// Compensation data is stored only for steps that have a compensator.
+func TestCompDataOnlyWithCompensator(t *testing.T) {
+	pool, eng := setup(t, saga.Options{})
+	l := newLedger()
+	withComp := addStep(t, l, "with", 1, nil)
+	noComp := saga.DefineStep(testdb.UniqueName(t, "without"),
+		func(ctx context.Context, k saga.Key, v int) (int, string, error) { return v, "unused", nil }, nil)
+	wf := saga.DefineWorkflow(testdb.UniqueName(t, "wf"), 1, func(c saga.Ctx, v in) (out, error) {
+		x, err := withComp.Run(c, v.N)
+		if err != nil {
+			return out{}, err
+		}
+		y, err := noComp.Run(c, x)
+		return out{Total: y}, err
+	})
+	if _, err := wf.Run(context.Background(), eng, "k", in{N: 1}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := pool.Query(context.Background(), `SELECT seq, comp_data::text FROM saga.step ORDER BY seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for rows.Next() {
+		var seq int
+		var comp *string
+		if err := rows.Scan(&seq, &comp); err != nil {
+			t.Fatal(err)
+		}
+		if comp == nil {
+			got = append(got, fmt.Sprint(seq, ":NULL"))
+		} else {
+			got = append(got, fmt.Sprint(seq, ":", *comp))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{`1:"undo-with"`, "2:NULL"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("comp_data = %v, want %v", got, want)
 	}
 }
