@@ -57,7 +57,7 @@ func main() {
 - Durable retries (`WithRetry`, `Permanent`), `Sleep`, `Await` / `Engine.Signal` / `Engine.SignalKey`, step and run timeouts.
 - Compensation in reverse order with durable retries, `needs_attention` and `Engine.RetryCompensation`.
 - Business locks (`saga.Lock`) and the `idem` package for exactly-once module effects.
-- `eventbus`: staging + outbox + relay to BullMQ, released only when a run is done.
+- `eventbus`: staging + outbox + relay to BullMQ, released only when a run is done; consumer groups (one per service, Redis only via `eventbus/consume`) with routing in Redis, per-handler retry, rolling-deploy hand-off.
 - `Observer` for metrics, `RunHook` for transactional extensions, retention (`Options.Retention`).
 
 ## Documentation

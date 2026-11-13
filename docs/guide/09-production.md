@@ -40,7 +40,8 @@ func main() {
 	must(eventbus.Migrate(ctx, pool))
 	eng := mustEngine(pool)
 	must(eng.Start(ctx))
-	must(bus.Start(ctx))
+	must(events.Start(ctx))      // eventbus producer: relay + retention
+	must(consumer.Start(ctx))    // this service's event handlers, if any
 	srv := startHTTP()
 
 	<-ctx.Done()
@@ -48,7 +49,8 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdown)   // 1. stop accepting requests
 	_ = eng.Stop(shutdown)       // 2. drain runs; cancel and hand over the rest
-	_ = bus.Stop(shutdown)       // 3. stop relay and workers
+	_ = events.Stop(shutdown)    // 3. stop the relay
+	_ = consumer.Stop(shutdown)  //    and the event handlers
 	pool.Close()
 }
 ```
@@ -70,7 +72,7 @@ func main() {
 - Change the step sequence only with a new workflow version, and keep the old version until its runs are done (chapter 3).
 - Never rename a step that has recorded rows; never change its output or compensation data types incompatibly.
 - Adding a compensator to a step that had none: steps recorded before have no compensation data and are compensated as uncertain (`CompensationUncertain` true, zero data). Write the new compensator so it works from the key.
-- Event subscribers must be registered on every relaying instance before events for them are emitted.
+- Event consumer groups register their routes when they start; a group does not receive the events relayed before its first registration (chapter 7).
 
 ## Monitoring
 

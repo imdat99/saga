@@ -17,6 +17,7 @@ Legend: `[x]` done, `[~]` in progress, `[ ]` todo. Update this file in the same 
 | M6 | Example modulith, e2e, benchmarks, observability | Done |
 | M7 | GC and allocation diet of the hot path | Done |
 | M8 | Allocation diet, second pass | Done |
+| M9 | Event bus for several services: consumer groups, Redis registry, producer/consumer split | Done |
 
 ## M0 - Skeleton
 
@@ -122,6 +123,22 @@ Start: 69 allocs/op (`BenchmarkStepRun`). Breakdown per run: ~21 pgconn command 
 - [x] Round 6 - encode through a pointer when the type provably encodes the same (no pointer-receiver marshal method on the value or on anything reached through struct fields and arrays), uuid v7 without the reader allocation. 52 -> 40. Review: PASS (byte equality checked against the json/v2 source; extra cases tested: pointer root, omitzero with pointer `IsZero`, pointer `MarshalText` map keys)
 - [x] Verified: benchmarks (interleaved benchstat vs M7: 69 -> 40 allocs/op, -8.5% B/op, latency unchanged), full suite, `-count=10 . ./internal/store`, chaos, lint; one review per round focused on invariants (3 rounds, all PASS on the first review)
 
+## M9 - Event bus for several services
+
+Bug (found by the user, reproduced by `TestSubscriberInAnotherService`: 20 of 40 deliveries lost): a relay fanned events out only to the subscribers registered in its own process, so a subscriber of another service (or another instance with a different subscriber set) missed every event relayed elsewhere, and a service could not subscribe without a Postgres pool (every Bus ran the relay). Tests only ever ran publisher and subscribers in one Bus. Design after reading Medusa's event-bus-redis (one queue, job per event, worker runs all local subscribers, completedSubscriberIds on retry, server/worker modes), keeping our transactional outbox and staging.
+
+- [x] Consumer groups: one BullMQ queue per group (a service), one job per (event, group), job id `<eventID>.<group>`; the group's workers run every local handler of the event, recording completed subscribers in the job data so a retry skips them (Medusa); a handler returning `Unrecoverable` is given up without failing the others
+- [x] Registry in Redis: `routes` (event -> groups, union across the group's instances) and `groups` (retry policy), with a version counter so relays reload only on change; `Unregister(group)`, `Forget(group, event)`
+- [x] Split: `NewProducer(pool, opts)` (EmitTx, RunEnded, relay, retention) and the leaf package `eventbus/consume` (Consumer, Event, Subscriber; depends on bullmq only, no Postgres/saga/River), aliased from `eventbus`; `Bus` removed (breaking, `feat!`)
+- [x] Rolling deploy: an event routed to the group but without a local handler on this instance fails retryably (another instance takes the retry)
+- [x] Performance: each event encoded once per pass (JSON built by Postgres, shared by every group's job), job options precomputed per group, one options slice per pass; relay and consumer benchmarks with allocation budgets in CI
+- [x] Tests written first: two services both receive every event with two relaying producers, consumer without Postgres, partial retry, rolling deploy, unrecoverable handler, registry change picked up, unregister/forget, plus the existing lifecycle, crash-after-push and saga tests ported
+- [x] Docs: guide chapter 7 (both languages), operations, README, decision log, known limitations; modulith example ported
+- [~] Review round 1: FAIL (EmitTx bytea in PgBouncer modes, handler panic, given-up handlers completing, empty-registry drops, hand-off bound, consumer deps, sequential group push, unbounded scratch); all fixed with tests (query modes, panic, failed set, held events, registry loss, deterministic hand-off with Attempts=1, mutation-checked)
+- [x] Review round 2: FAIL (addAll could return with pushes in flight reading the reused arena; forgotten routes cycling every 500ms; registry loss with several groups; scratch references kept); fixed: queues resolved before any push, age-based hand-off delay, registry epoch + sticky routes for RegistryGrace, scratch cleared; tests for each (mutation-checked)
+- [x] Review round 3: PASS (two residual windows after Redis data loss documented as known limitations with a recovery procedure)
+- [x] Verified: full suite with race, `-count=10 ./eventbus/...`, chaos, golangci-lint, actionlint, benchmarks within the CI budget (relay 10448 allocs/pass for 2 groups, 5335 for one group with 2 handlers, EmitTx 12, consume 2)
+
 ## Docs - User guide
 
 - [x] Bilingual user guide: `docs/guide` (English, primary) and `docs/huong-dan` (Vietnamese, same structure): getting started, steps, workflows, runs, waiting, modules (`idem`), event bus, testing, production, troubleshooting
@@ -155,7 +172,10 @@ Start: 69 allocs/op (`BenchmarkStepRun`). Breakdown per run: ~21 pgconn command 
 - Locks are polled, not queued (no fairness, no deadlock detection): take several locks in a fixed order.
 - `idem.Do` under REPEATABLE READ/SERIALIZABLE turns a concurrent duplicate into a serialization error (40001): callers retry.
 - The allocation fast path of hot-path statements (M7) is off when the pool has a pgx tracer (e.g. OpenTelemetry) or a query mode other than `QueryExecModeCacheStatement`: those pools use the regular pgx path, about twice the allocations per step. On the fast path a custom pgconn `BuildContextWatcherHandler` is not used: cancellation interrupts the statement with a connection deadline (pgconn's default behaviour).
-- Every instance relaying must register the same subscribers: a relay that does not know a subscriber skips it for the events it relays (rolling deploy adding a subscriber).
+- Event bus (M9): a consumer group receives the events relayed after its first registration only; an event no registered group handles is marked sent to nobody (except before any group ever registered: then the outbox is held). Removing a route is manual (`Forget`, `Unregister`): routes are a union across a group's instances.
+- Event bus after Redis loses its data (registry and queues): relays running at the time keep the routes they knew for `RegistryGrace` (2 min) while running consumers register again. Two windows remain: a relay started after the loss knows no routes, so once the first group registers, the other groups miss events until they register again (up to `RegistryCheck`, 30 s); and a group with no running consumer at that moment is not registered again, so its events are dropped once the grace ends. Recovery procedure: start (or restart) one consumer of every group, then the producers.
+- Event bus relay cost is dominated by bullmq's `AddBulk` (~18 allocations per job with bullmq v0.2.0, and still a `SCRIPT LOAD` round trip per call): optimizing it belongs in github.com/imdat99/bullmq.
+- Within a consumer group, every instance must run the same handlers apart from rolling deploys; a job for an event an instance lacks is handed off without spending attempts for `HandOffWindow` (30 min), then counts attempts.
 - The relay holds its outbox rows locked while it calls Redis (bounded batch): a slow Redis slows the relay, it does not lose events. An event that can never be pushed blocks its batch (no quarantine).
 - A `RunHook` that keeps failing (e.g. eventbus schema not migrated) makes the run's terminal transition fail on every resume; the run is never parked.
 - `eventbus.Unrecoverable` keeps only the error message (BullMQ API).

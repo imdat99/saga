@@ -39,7 +39,8 @@ jobs:
 
   perf:
     runs-on: ubuntu-latest
-    # Benchmarks against the testcontainers Postgres, checked against
+    # Benchmarks (engine and event bus) against the testcontainers Postgres
+    # and Redis, checked against
     # .github/perf-budget.txt (medians of 5 runs). Commit cost is excluded
     # (SAGA_BENCH_ASYNC_COMMIT): the gate measures the engine, not the disk.
     env:
@@ -50,9 +51,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Benchmarks
+      - name: Benchmarks (engine)
         shell: bash # -o pipefail: a failing benchmark must fail the step despite tee
         run: go test -run '^$' -bench . -benchtime 500x -count 5 . | tee bench.txt
+      - name: Benchmarks (event bus)
+        shell: bash
+        run: go test -run '^$' -bench . -benchtime 300x -count 5 ./eventbus/... | tee -a bench.txt
       - name: Performance budget
         run: go run ./internal/tools/benchgate -budget .github/perf-budget.txt -summary "$GITHUB_STEP_SUMMARY" bench.txt
       - uses: actions/upload-artifact@v4

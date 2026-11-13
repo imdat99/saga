@@ -42,7 +42,8 @@ type Config struct {
 type App struct {
 	Pool      *pgxpool.Pool
 	Engine    *saga.Engine
-	Bus       *eventbus.Bus
+	Events    *eventbus.Producer // emits (modules) and relays to the queues
+	Consumer  *eventbus.Consumer // this service's handlers (group "modulith")
 	Inventory *inventory.Service
 	Payment   *payment.Service
 	Orders    *order.Service
@@ -77,21 +78,29 @@ func (a *App) wire(ctx context.Context, cfg Config) error {
 	if err := eventbus.Migrate(ctx, a.Pool); err != nil {
 		return err
 	}
-	a.Bus = eventbus.New(a.Pool, eventbus.Options{
-		Redis:  bullmq.RedisConnectionOptions{URL: cfg.RedisURL},
-		Prefix: cfg.RedisPrefix,
-		Logger: cfg.Logger,
+	redis := bullmq.RedisConnectionOptions{URL: cfg.RedisURL}
+	a.Events = eventbus.NewProducer(a.Pool, eventbus.ProducerOptions{
+		Redis: redis, Prefix: cfg.RedisPrefix, Logger: cfg.Logger,
 	})
+	// One consumer group for the whole modulith (one codebase); another
+	// service would create its own group with NewConsumer and Redis only.
+	consumer, err := eventbus.NewConsumer("modulith", eventbus.ConsumerOptions{
+		Redis: redis, Prefix: cfg.RedisPrefix, Logger: cfg.Logger,
+	})
+	if err != nil {
+		return err
+	}
+	a.Consumer = consumer
 	a.Inventory = inventory.New(a.Pool)
 	a.Payment = payment.New(a.Pool)
-	a.Orders = order.New(a.Pool, a.Bus)
+	a.Orders = order.New(a.Pool, a.Events)
 	for _, m := range []interface{ Migrate(context.Context) error }{a.Inventory, a.Payment, a.Orders} {
 		if err := m.Migrate(ctx); err != nil {
 			return err
 		}
 	}
 
-	if err := a.Bus.Subscribe(eventbus.Subscriber{
+	if err := a.Consumer.Subscribe(eventbus.Subscriber{
 		ID: "mail.order-confirmation", Event: order.CreatedEvent,
 		Handle: func(ctx context.Context, ev eventbus.Event) error {
 			var c order.Created
@@ -107,7 +116,7 @@ func (a *App) wire(ctx context.Context, cfg Config) error {
 	}); err != nil {
 		return err
 	}
-	if err := a.Bus.Subscribe(eventbus.Subscriber{
+	if err := a.Consumer.Subscribe(eventbus.Subscriber{
 		ID: "ops.needs-attention", Event: eventbus.NeedsAttentionEvent,
 		Handle: func(ctx context.Context, ev eventbus.Event) error {
 			a.log.Error("saga needs attention", "event", string(ev.Payload))
@@ -120,7 +129,7 @@ func (a *App) wire(ctx context.Context, cfg Config) error {
 	eng, err := saga.New(a.Pool, saga.Options{
 		InstanceID: cfg.InstanceID,
 		LeaseTTL:   cfg.LeaseTTL,
-		Hooks:      []saga.RunHook{a.Bus},
+		Hooks:      []saga.RunHook{a.Events},
 		Observer:   cfg.Observer,
 		Retention:  30 * 24 * time.Hour,
 		Logger:     cfg.Logger,
@@ -134,18 +143,21 @@ func (a *App) wire(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-// Start starts the saga engine and the event bus.
+// Start starts the saga engine, the event relay and the event handlers.
 func (a *App) Start(ctx context.Context) error {
 	if err := a.Engine.Start(ctx); err != nil {
 		return err
 	}
-	return a.Bus.Start(ctx)
+	if err := a.Consumer.Start(ctx); err != nil {
+		return err
+	}
+	return a.Events.Start(ctx)
 }
 
 // Stop drains the engine (runs left over are released for recovery), stops
 // the bus and closes the pool.
 func (a *App) Stop(ctx context.Context) error {
-	err := errors.Join(a.Engine.Stop(ctx), a.Bus.Stop(ctx))
+	err := errors.Join(a.Engine.Stop(ctx), a.Events.Stop(ctx), a.Consumer.Stop(ctx))
 	a.Pool.Close()
 	return err
 }

@@ -40,7 +40,8 @@ func main() {
 	must(eventbus.Migrate(ctx, pool))
 	eng := mustEngine(pool)
 	must(eng.Start(ctx))
-	must(bus.Start(ctx))
+	must(events.Start(ctx))      // producer eventbus: relay + retention
+	must(consumer.Start(ctx))    // các handler event của service, nếu có
 	srv := startHTTP()
 
 	<-ctx.Done()
@@ -48,7 +49,8 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdown)   // 1. ngừng nhận request
 	_ = eng.Stop(shutdown)       // 2. chờ run xong; huỷ và bàn giao phần còn lại
-	_ = bus.Stop(shutdown)       // 3. dừng relay và worker
+	_ = events.Stop(shutdown)    // 3. dừng relay
+	_ = consumer.Stop(shutdown)  //    và các handler event
 	pool.Close()
 }
 ```
@@ -70,7 +72,7 @@ func main() {
 - Chỉ đổi chuỗi step bằng version workflow mới, và giữ version cũ cho tới khi các run của nó xong (chương 3).
 - Không đổi tên step đã có dữ liệu ghi; không đổi kiểu output hay dữ liệu compensation một cách không tương thích.
 - Thêm compensator cho step trước đó không có: các step đã ghi trước đó không có dữ liệu compensation và được compensate ở chế độ uncertain (`CompensationUncertain` là true, dữ liệu zero). Viết compensator mới sao cho chạy được chỉ từ key.
-- Subscriber của event bus phải được đăng ký trên mọi instance có relay trước khi event cho chúng được phát.
+- Consumer group của event bus tự đăng ký định tuyến khi `Start`; event được relay trước lần đăng ký đầu tiên của một group thì group đó không nhận (xem chương 7).
 
 ## Giám sát
 

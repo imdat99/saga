@@ -6,12 +6,15 @@ toolchain go1.27.4
 
 require (
 	github.com/google/uuid v1.6.0
+	github.com/imdat99/bullmq v0.2.0
 	github.com/jackc/pgx/v5 v5.13.0
 	github.com/pressly/goose/v3 v3.30.0
+	github.com/redis/go-redis/v9 v9.23.0
 	github.com/riverqueue/river v0.51.2
 	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.51.2
 	github.com/testcontainers/testcontainers-go v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
+	github.com/testcontainers/testcontainers-go/modules/redis v0.45.0
 )
 
 require (
@@ -33,7 +36,6 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
-	github.com/imdat99/bullmq v0.1.1 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.3 // indirect
@@ -54,7 +56,6 @@ require (
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/redis/go-redis/v9 v9.23.0 // indirect
 	github.com/riverqueue/river/riverdriver v0.51.2 // indirect
 	github.com/riverqueue/river/rivershared v0.51.2 // indirect
 	github.com/riverqueue/river/rivertype v0.51.2 // indirect
@@ -63,7 +64,6 @@ require (
 	github.com/shirou/gopsutil/v4 v4.26.6 // indirect
 	github.com/sirupsen/logrus v1.10.2 // indirect
 	github.com/stretchr/testify v1.12.1 // indirect
-	github.com/testcontainers/testcontainers-go/modules/redis v0.45.0 // indirect
 	github.com/tidwall/gjson v1.20.0 // indirect
 	github.com/tidwall/match v1.2.0 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
