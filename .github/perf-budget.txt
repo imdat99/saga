@@ -19,16 +19,17 @@ BenchmarkStepRun                p95-ms/step   <=   5
 BenchmarkRunsThreeInstances     allocs/op     <=   70
 BenchmarkRunsThreeInstances     runs/s        >=   50
 
-# Event bus (go test -bench . -benchtime 300x -count 5 ./eventbus/...), M9:
-# one relay pass = 200 events. Measured: Relay (2 groups, 2 jobs/event)
-# 10431 allocs, 947 KB, ~62 ms; one group with 2 handlers (1 job/event) 5328
-# allocs, 484 KB; consuming a job 2 allocs; EmitTx of one event 12 allocs
-# (the payload is copied to a string: bytea would break PgBouncer modes).
-# Most relay allocations are inside bullmq's AddBulk (~24 per job).
-BenchmarkRelay                    allocs/op     <=   11500
+# Event bus (go test -bench . -benchtime 300x -count 5 ./eventbus/...):
+# one relay pass = 200 events. Measured with bullmq v0.2.0: Relay (2 groups,
+# 2 jobs/event) 8047 allocs, 984 KB, ~59 ms; one group with 2 handlers
+# (1 job/event) 4136 allocs, 508 KB; consuming a job 2 allocs; EmitTx of one
+# event 12 allocs (the payload is copied to a string: bytea would break
+# PgBouncer modes). Most relay allocations are inside bullmq's AddBulk
+# (~18 per job; v0.1.1 had ~24: 10447 and 5336 allocs, 949 and 484 KB).
+BenchmarkRelay                    allocs/op     <=   9000
 BenchmarkRelay                    B/op          <=   1050000
 BenchmarkRelay                    ns/op         <=   250000000
-BenchmarkRelayOneGroupTwoHandlers allocs/op     <=   6000
+BenchmarkRelayOneGroupTwoHandlers allocs/op     <=   4600
 BenchmarkRelayOneGroupTwoHandlers B/op          <=   550000
 BenchmarkConsume                  allocs/op     <=   4
 BenchmarkEmitTx                   allocs/op     <=   14

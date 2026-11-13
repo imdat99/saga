@@ -92,7 +92,7 @@ Producers (`eventbus.NewProducer`, Postgres and Redis) emit into the outbox and 
 - Delivery is at least once and unordered: handlers deduplicate by `Event.ID` and re-read state. A retry runs only the handlers of the group that failed.
 - Failed jobs stay 7 days in BullMQ's failed set (dead letter queue); completed jobs 24h.
 - Sent outbox rows, and staging rows of runs that already ended, are deleted after `Retention` (7 days) by a retention loop every `CleanupInterval` (1 minute), in batches of 5000 until caught up.
-- Cost per relayed job is dominated by BullMQ's `AddBulk` (about 24 allocations and its Redis round trips); a group with several handlers of an event costs one job, not one per handler ([benchmarks](benchmarks.md)).
+- Cost per relayed job is dominated by BullMQ's `AddBulk` (about 18 allocations with bullmq v0.2.0, and its Redis round trips); a group with several handlers of an event costs one job, not one per handler ([benchmarks](benchmarks.md)).
 
 ## Retention and vacuum
 
