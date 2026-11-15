@@ -95,7 +95,7 @@ A failing compensator is retried durably:
 saga.WithCompensatePolicy(saga.Exponential(10, time.Second)) // default: 10 attempts from 1s
 ```
 
-When the policy is exhausted (or the compensator returns `saga.Permanent`), the run stops in status `needs_attention`, keeps its business locks until their TTL, and the event bus (if configured) emits `saga.needs_attention`. Fix the cause, then call `eng.RetryCompensation(ctx, runID)` (chapter 4).
+When the policy is exhausted (or the compensator returns `saga.Permanent`), the run stops in status `needs_attention`, keeps its business locks until their TTL, and run-end hooks see it (e.g. to emit an alert, chapter 7). Fix the cause, then call `eng.RetryCompensation(ctx, runID)` (chapter 4).
 
 ## Checklist for a step
 

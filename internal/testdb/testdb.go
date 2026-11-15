@@ -1,5 +1,11 @@
-// Package testdb starts one Postgres container per test binary and hands each
-// test its own freshly created database, so tests can run in parallel.
+// Package testdb hands each test its own freshly created database on a shared
+// Postgres server, so tests can run in parallel (also across packages: names
+// include the process id).
+//
+// The server is the docker compose one by default (make up); SAGA_TEST_DSN
+// points elsewhere. Testcontainers is deliberately not used: Go modules have
+// no test-only dependencies, so it would sit in the go.mod every user of the
+// library downloads and resolves.
 package testdb
 
 import (
@@ -17,9 +23,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 var (
@@ -29,30 +32,35 @@ var (
 	counter atomic.Int64
 )
 
-// DSNEnv overrides the container: point it at an existing server (the user
-// must be allowed to CREATE DATABASE).
+// DSNEnv points the tests at a Postgres server; the user must be allowed to
+// CREATE DATABASE. Unset, DefaultDSN (docker compose) is used.
 const DSNEnv = "SAGA_TEST_DSN"
 
+// DefaultDSN is the Postgres of the repository's docker-compose.yml.
+const DefaultDSN = "postgres://saga:saga@localhost:5432/saga?sslmode=disable" //nolint:gosec // local docker compose credentials, test only
+
 func start() {
-	if dsn := os.Getenv(DSNEnv); dsn != "" {
-		baseDSN = dsn
-		return
+	baseDSN = os.Getenv(DSNEnv)
+	if baseDSN == "" {
+		baseDSN = DefaultDSN
 	}
-	ctx := context.Background()
-	c, err := tcpostgres.Run(ctx, "postgres:16-alpine",
-		tcpostgres.WithDatabase("saga"),
-		tcpostgres.WithUsername("saga"),
-		tcpostgres.WithPassword("saga"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).WithStartupTimeout(60*time.Second)),
-	)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, baseDSN)
 	if err != nil {
-		errInit = fmt.Errorf("start postgres container: %w", err)
+		errInit = fmt.Errorf("connect to %s (start it with `make up`, or set %s): %w", redact(baseDSN), DSNEnv, err)
 		return
 	}
-	// The container is reaped by testcontainers' Ryuk when the binary exits.
-	baseDSN, errInit = c.ConnectionString(ctx, "sslmode=disable")
+	_ = conn.Close(ctx)
+}
+
+// redact hides the password of dsn for error messages.
+func redact(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "the test database"
+	}
+	return u.Redacted()
 }
 
 // New returns a pool on a new empty database dropped when the test ends.

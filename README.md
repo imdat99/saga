@@ -4,8 +4,9 @@ Saga orchestrator for Go modular monoliths running as several instances.
 Postgres is the source of truth: every step outcome is checkpointed, runs are
 owned through a fenced lease kept alive by a batched heartbeat, and an
 interrupted run is resumed (or compensated) by whichever instance picks it up.
-River (in Postgres) drives recovery, retries, timers and signals; domain events
-go through a transactional outbox to BullMQ.
+River (in Postgres) drives recovery, retries, timers and signals. A run-end hook
+(`RunHook`), called in the transaction that ends a run, lets an application
+publish events only for runs that succeeded.
 
 Status: milestones M0 to M8 of [the plan](docs/PLAN.md) are implemented. See
 [TASKS.md](TASKS.md) for the checklist and the known limitations.
@@ -57,7 +58,6 @@ func main() {
 - Durable retries (`WithRetry`, `Permanent`), `Sleep`, `Await` / `Engine.Signal` / `Engine.SignalKey`, step and run timeouts.
 - Compensation in reverse order with durable retries, `needs_attention` and `Engine.RetryCompensation`.
 - Business locks (`saga.Lock`) and the `idem` package for exactly-once module effects.
-- `eventbus`: staging + outbox + relay to BullMQ, released only when a run is done.
 - `Observer` for metrics, `RunHook` for transactional extensions, retention (`Options.Retention`).
 
 ## Documentation
@@ -65,18 +65,20 @@ func main() {
 - **User guide**: [English](docs/guide/README.md) | [Tiếng Việt](docs/huong-dan/README.md): getting started, steps, workflows, runs, waiting, modules, events, testing, production, troubleshooting.
 - [Concepts](docs/concepts.md): runs, steps, keys, replay, compensation, parking.
 - [Guarantees and failure modes](docs/guarantees.md): what holds under crashes, partitions and redeploys.
-- [Operations](docs/operations.md): lifecycle, pool sizing, PgBouncer, timing, event bus, retention.
+- [Operations](docs/operations.md): lifecycle, pool sizing, PgBouncer, timing, retention.
 - [Patterns](docs/patterns.md): long-running external work, payload size.
 - [Quickstart](examples/quickstart/main.go): the two-step transfer of the guide's first chapter.
 - [Multi-workflow](examples/multiworkflow/README.md): a parent fanning out parallel child workflows, signals both ways, two-phase commit, cascading compensation.
+- [Event outbox](examples/outbox/outbox.go): staging, `RunHook`, relay to any broker; the code of guide chapter 12, tested.
 - [Long-running workflow](examples/longrunning/README.md): approval (`Await`/`Signal`), external callback (`SignalKey`), durable timer (`Sleep`), across processes and worker crashes.
-- [Example modulith](examples/modulith): three isolated modules, a checkout flow, HTTP API, multiple instances.
 
 ## Install
 
 ```bash
-go get github.com/imdat99/saga@latest   # or a specific release: @v0.1.0
+go get github.com/imdat99/saga@latest   # Postgres only: pgx, goose, River
 ```
+
+Event delivery is not part of this module: publish to any broker (Kafka, NATS, RabbitMQ, Redis...) from your own outbox, released by the engine's run-end hook ([guide chapters 7 and 12](docs/guide/12-event-integration.md), code in [examples/outbox](examples/outbox)).
 
 Releases are tagged automatically (see below); the list is on the repository's Releases page.
 
@@ -93,9 +95,10 @@ Nothing is tagged when a job fails. Pull requests run the same CI gate; protect 
 ## Development
 
 ```bash
-make test        # Docker required: tests start Postgres 16 and Redis 7 via testcontainers
+make up          # Postgres 16 (docker compose): the tests use it
+make test
 make test-chaos  # kills and freezes real child processes
 make lint
-SAGA_TEST_DSN=postgres://saga:saga@localhost:5432/saga?sslmode=disable make test  # reuse docker compose
+SAGA_TEST_DSN=postgres://... make test  # another server
 go test -run '^$' -bench . -benchtime 2000x -count 5 .  # benchmarks (see docs/benchmarks.md)
 ```

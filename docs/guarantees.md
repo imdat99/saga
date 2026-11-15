@@ -11,7 +11,7 @@
 | Compensation | At least once per completed or uncertain step, reverse order (with `Options.AsyncStepStart`, a step whose `started` record was lost in a Postgres crash and that is not re-run before compensating is not known to the engine) | Compensators found by name, durable retries |
 | Progress after a crash | Resumed by another instance | Lease expiry + leader recovery scan + River `resume_run` |
 | Wake-ups (retry, Sleep, Await timeout, signals) | Not lost | Job inserted in the same transaction as the park or signal; parked runs keep a `lease_until` safety net for recovery |
-| Events of a run | Published only if the run is done; at least once per subscriber | Staging released in the `done` transaction; outbox relayed with deterministic BullMQ job ids |
+| Run-end hooks | Committed atomically with the terminal status, at least once | `RunHook.RunEnded` in the terminal transaction, under the lease; a failure rolls the transition back and it is retried |
 | Time | Database time only | `now()` for leases, wake-ups, deadlines, locks |
 
 ## Failure modes
@@ -21,10 +21,6 @@
 **Instance pause (GC, VM freeze) or partition from Postgres.** Another instance takes over after the TTL. When the paused instance wakes up, its next checkpoint fails (`ErrLeaseLost`), its heartbeat cancels the run context, and nothing it does afterwards is recorded. A side effect it performs in the meantime is deduplicated by the module (`idem`), or fenced off by `idem.Abort` if the run was compensated. Covered by `test/chaos` (SIGSTOP past the lease).
 
 **Postgres unavailable.** Checkpoints fail and runs stop (no progress without the source of truth). If renewal fails for `LeaseTTL - LeaseTTL/3`, the instance cancels its runs itself. Everything resumes from the last checkpoint once Postgres is back.
-
-**Redis unavailable.** Saga execution is unaffected. Events accumulate in the outbox and are pushed when Redis returns. Jobs already pushed live in Redis: run it with AOF (`appendfsync always` to lose none).
-
-**Relay crash between push and marking rows sent.** The rows are pushed again with the same job ids; BullMQ ignores them (within `CompletedRetention`).
 
 **Graceful shutdown.** `Stop` drains, then cancels what is left and releases the leases so another instance resumes at once.
 

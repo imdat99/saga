@@ -89,7 +89,7 @@ Giữ tuổi purge **dài hơn** retention của saga và độ trễ resume hay
 
 ## Ranh giới module
 
-Example modulith minh hoạ cách tổ chức chặt chẽ:
+Một cách tổ chức chặt chẽ để giữ các module tách biệt:
 
 - mỗi module có schema riêng và một role `NOLOGIN`, chạy transaction với `SET LOCAL ROLE`;
 - module không bao giờ import lẫn nhau; chỉ package `flows` biết nhiều module và định nghĩa step, workflow;

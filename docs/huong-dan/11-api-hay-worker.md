@@ -104,7 +104,7 @@ Không lời gọi nào cần `eng.Start`: engine chưa từng gọi `Start` v�
 
 ### Một binary, mọi instance làm cả hai việc (mặc định)
 
-Mọi instance phục vụ HTTP, chạy run inline và gọi `eng.Start`. Đây là cách đơn giản nhất và là cách example modulith dùng. Hãy bắt đầu từ đây.
+Mọi instance phục vụ HTTP, chạy run inline và gọi `eng.Start`. Đây là cách đơn giản nhất. Hãy bắt đầu từ đây.
 
 ### Tách vai trò API và worker
 

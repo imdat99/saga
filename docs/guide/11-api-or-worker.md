@@ -104,7 +104,7 @@ None of them needs `eng.Start`: an engine that never called `Start` can still en
 
 ### One binary, every instance does both (default)
 
-Every instance serves HTTP, runs inline runs, and calls `eng.Start`. This is the simplest setup and the one the example modulith uses. Start here.
+Every instance serves HTTP, runs inline runs, and calls `eng.Start`. This is the simplest setup. Start here.
 
 ### Split API and worker roles
 

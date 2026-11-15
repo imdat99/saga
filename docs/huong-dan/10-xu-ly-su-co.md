@@ -100,8 +100,6 @@ WHERE status IN ('retrying', 'started') GROUP BY name ORDER BY count(*) DESC;
 -- Business lock đang giữ
 SELECT key, run_id, until FROM saga.lock ORDER BY until;
 
--- Tồn đọng outbox (event bus)
-SELECT count(*), min(created_at) FROM eventbus.outbox WHERE sent_at IS NULL;
 ```
 
 Không bao giờ sửa tay `saga.run` hay `saga.step` của một run có thể đang chạy: mọi lần ghi của engine đều được fencing theo lease, và một lần ghi thủ công có thể phá vỡ điều đó. Hãy dùng `RetryCompensation`, `Signal`, hoặc để lease hết hạn.

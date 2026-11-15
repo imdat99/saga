@@ -4,11 +4,10 @@
 
 - Go 1.27 or later.
 - Postgres (the repository is tested on 16 only). The engine keeps everything there: runs, steps, signals, locks, and its job queue (River).
-- Redis 7 only if you use the event bus (chapter 7).
 
 ```bash
 go get github.com/imdat99/saga@latest   # tagged releases: vX.Y.Z
-make up   # in this repository: Postgres 16 and Redis 7 from docker-compose.yml
+make up   # in this repository: Postgres 16 from docker-compose.yml
 ```
 
 ## The model in one paragraph

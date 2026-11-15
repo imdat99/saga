@@ -9,7 +9,7 @@ SAGA_TEST_DSN='postgres://saga:saga@localhost:5432/saga?sslmode=disable' \
 # commit-cost check: same, with SAGA_BENCH_ASYNC_COMMIT=1 (engine sessions use synchronous_commit=off)
 ```
 
-Do not benchmark against the testcontainers Postgres (`make test`'s default): it runs with `fsync=off`, which hides the commit cost.
+Benchmark on a Postgres with the default durability, like the compose one. Measurements below that say "testcontainers Postgres" were taken on the container the tests started before 2026-11-15, which ran with `fsync=off` (commit cost hidden).
 
 - `BenchmarkStepRun`: one instance, inline runs of 10 no-op steps; the per-step latency (p50/p95/p99) is the engine's overhead.
 - `BenchmarkRunsThreeInstances`: three engines with separate pools (6 connections each) on one database, 24 concurrent callers, in one process sharing 6 CPUs with Postgres; runs/s and per-step latency under contention (includes pool queueing).

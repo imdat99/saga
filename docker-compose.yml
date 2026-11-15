@@ -1,3 +1,5 @@
+# Postgres for manual runs and for the tests (make up). Test binaries of every
+# package share this server: each test gets its own database (internal/testdb).
 services:
   postgres:
     image: postgres:16-alpine
@@ -5,16 +7,12 @@ services:
       POSTGRES_USER: saga
       POSTGRES_PASSWORD: saga
       POSTGRES_DB: saga
+    # go test runs packages in parallel against this one server: the default
+    # 100 connections run out.
+    command: ["postgres", "-c", "max_connections=500"]
     ports:
       - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U saga"]
       interval: 2s
       retries: 20
-
-  redis:
-    image: redis:7-alpine
-    # BullMQ needs noeviction (evicted keys mean lost jobs) and AOF for durability.
-    command: ["redis-server", "--maxmemory-policy", "noeviction", "--appendonly", "yes"]
-    ports:
-      - "6379:6379"

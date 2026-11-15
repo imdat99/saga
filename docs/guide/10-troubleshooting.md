@@ -100,8 +100,6 @@ WHERE status IN ('retrying', 'started') GROUP BY name ORDER BY count(*) DESC;
 -- Business locks held
 SELECT key, run_id, until FROM saga.lock ORDER BY until;
 
--- Outbox backlog (event bus)
-SELECT count(*), min(created_at) FROM eventbus.outbox WHERE sent_at IS NULL;
 ```
 
 Never update `saga.run` or `saga.step` by hand for a run that may be executing: every write of the engine is fenced on the lease, and a manual write can break that. Use `RetryCompensation`, `Signal`, or let the lease expire.

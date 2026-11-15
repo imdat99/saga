@@ -1,97 +1,33 @@
-# 7. Event bus
+# 7. Events and run-end hooks
 
-The `eventbus` package publishes domain events through a transactional outbox in Postgres to BullMQ (Redis). Its key property for sagas: events emitted inside a step are **held until the run is done**. A run that compensates publishes nothing, so other parts of the system never react to an order that was rolled back.
+Steps call modules directly. Other parts of the system (mail, invoicing in another service, analytics) often need to **react after a saga succeeded**: "order placed". The engine does not deliver events itself; it gives you the one hook that makes publishing them correct.
 
-## Setup
+## Why not publish from a step
 
-```go
-bus := eventbus.New(pool, eventbus.Options{
-	Redis: bullmq.RedisConnectionOptions{URL: redisURL},
-})
-if err := eventbus.Migrate(ctx, pool); err != nil { ... }    // schema "eventbus"
+A step runs **at least once**, and a run that completed a step can still be **compensated** later. An event published from inside a step can therefore:
 
-// Subscribers: register the same set on every instance that relays.
-err := bus.Subscribe(eventbus.Subscriber{
-	ID:     "billing.invoice",      // stable: part of BullMQ job ids
-	Event:  "order.created",
-	Handle: billing.OnOrderCreated, // nil on instances that only relay
-})
+- go out twice (the step is re-executed after a crash or retry);
+- go out for an order that was then rolled back (a later step failed, the run compensated).
 
-eng, err := saga.New(pool, saga.Options{Hooks: []saga.RunHook{bus}}) // releases events when runs end
-if err := bus.Start(ctx); err != nil { ... }                          // relay, workers, retention
-defer bus.Stop(shutdownCtx)
-```
+Publishing after `Run` returns does not help either: a crash between the commit and the publish loses the event, and runs that finish on another instance (after a retry or takeover) never return to your caller.
 
-Redis must run with `maxmemory-policy noeviction` and AOF (`docker-compose.yml` does).
+## The pattern: stage in the step, release when the run is done
 
-## Emitting
+1. **Stage.** Inside the step, the module writes the event in **its own transaction**, together with its business change, into a staging table, tagged with the run id (`saga.RunIDFrom(ctx)`). Give the event a deterministic id derived from the step key, so a re-executed step does not stage it twice.
+2. **Release or drop.** Implement `saga.RunHook`. `RunEnded` is called **inside the transaction that records the run's terminal status**, under the run's lease: a `done` run moves its staged events to an outbox, a `compensated` run deletes them. Both commit atomically with the status, so a rolled-back run never publishes anything.
+3. **Relay.** A loop reads the outbox and publishes to your broker (at least once: consumers deduplicate by event id), then marks the rows sent.
 
-Emit from the module, in the same transaction as the effect, with the **step's context**:
+Outside a saga (`RunIDFrom` returns false), the module writes straight to the outbox in its transaction. Compensators are outside too: what they emit ("order cancelled") is published even though the run is compensated.
 
-```go
-func (s *Service) Create(ctx context.Context, key string, o Order) (Order, error) {
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		created, err := idem.Do(ctx, tx, requests, key, func(ctx context.Context) (Order, error) {
-			o.ID = key
-			if _, err := tx.Exec(ctx, `INSERT INTO orders.order ...`); err != nil {
-				return Order{}, err
-			}
-			ev, err := eventbus.NewEvent("order.created", OrderCreated{ID: o.ID})
-			if err != nil {
-				return Order{}, err
-			}
-			return o, s.bus.EmitTx(ctx, tx, ev)
-		})
-		o = created
-		return err
-	})
-	return o, err
-}
-```
+The complete integration (engine contract, schema, hook, relay, broker notes, consumers, operations, tests) is in [chapter 12](12-event-integration.md); its code, tested in CI, is in [examples/outbox](../../examples/outbox).
 
-- With a step's `ctx` (`saga.RunIDFrom(ctx)` finds the run), the event is **staged**. It moves to the outbox in the transaction that marks the run `done`, and is dropped if the run is compensated.
-- With a context that is not a step's (an HTTP handler, a background job), it goes straight to the outbox and is delivered once `tx` commits.
-- Do not emit from the workflow body: it re-executes on every resume and would stage the event again. Do not use `context.Background()` inside a step: that bypasses staging.
-- Emitting inside `idem.Do` makes the event once-per-key too.
+Rules for hooks:
 
-## Handling
+- `RunEnded` runs on the engine's hot path, in the terminal transaction: keep it to a few indexed statements. With any hook, ending a run costs a transaction instead of one statement.
+- Returning an error rolls the terminal transition back, with everything the hook wrote; the run is resumed later and the hook called again from a clean state.
+- Never call the network from a hook (no broker, no HTTP): it holds the run's row lock. Publishing is the relay's job.
+- A `needs_attention` run is a good place to emit an alert event (`run.Error` holds the cause).
 
-```go
-func OnOrderCreated(ctx context.Context, ev eventbus.Event) error {
-	var p OrderCreated
-	if err := ev.Decode(&p); err != nil {
-		return eventbus.Unrecoverable(err) // bad payload: do not retry
-	}
-	return invoices.CreateOnce(ctx, ev.ID, p.ID) // deduplicate by ev.ID
-}
-```
+## Choosing the broker
 
-Delivery is **at least once** and **unordered**:
-
-- deduplicate by `Event.ID` (e.g. with `idem.Do` keyed by it);
-- re-read current state instead of trusting the order of events;
-- a returned error retries with the subscriber's backoff (`Attempts` default 5, `Backoff` default 1 s doubling); `eventbus.Unrecoverable(err)` fails the job at once. Failed jobs stay 7 days in BullMQ's failed set (the dead letter queue).
-
-Each subscriber gets its own BullMQ queue by default (`Queue` to group them; then every instance with a handler for one needs handlers for all).
-
-## The needs_attention event
-
-When a run is parked as `needs_attention`, the bus emits `eventbus.NeedsAttentionEvent` (`"saga.needs_attention"`) with an `eventbus.NeedsAttention` payload (`RunID`, `Workflow`, `Version`, `Error`) in the same transaction. Subscribe to it to alert on-call:
-
-```go
-_ = bus.Subscribe(eventbus.Subscriber{
-	ID:    "ops.alert",
-	Event: eventbus.NeedsAttentionEvent,
-	Handle: func(ctx context.Context, ev eventbus.Event) error {
-		var na eventbus.NeedsAttention
-		if err := ev.Decode(&na); err != nil {
-			return eventbus.Unrecoverable(err)
-		}
-		return pager.Notify(ctx, ev.ID, fmt.Sprintf("saga %s (%s) needs attention: %s", na.RunID, na.Workflow, na.Error))
-	},
-})
-```
-
-## Operating it
-
-See [Operations: Event bus](../operations.md#event-bus) for Redis durability, relay behaviour, retiring subscribers and retention.
+The engine knows no broker: the relay is yours, and so is the choice (Kafka, NATS, RabbitMQ, Redis streams or queues). Whatever it is, keep the two properties above: events are written in the business transaction (never published directly from a step), and released by the hook in the run's terminal transaction. Changing broker later only changes the relay.

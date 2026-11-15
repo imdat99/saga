@@ -9,7 +9,7 @@ eng, err := saga.New(pool, saga.Options{
 	RecoveryInterval:  10 * time.Second, // leader quét lease hết hạn
 	ShutdownGrace:     5 * time.Second,  // Stop chờ bao lâu sau khi huỷ run
 	Retention:         30 * 24 * time.Hour, // xoá run đã kết thúc; cũng là cửa sổ khử trùng lặp key
-	Hooks:             []saga.RunHook{bus},  // event bus
+	Hooks:             []saga.RunHook{outbox}, // hook khi run kết thúc, ví dụ outbox event (chương 7)
 	Observer:          metrics,              // xem phần Giám sát
 	Logger:            logger,
 	// InstanceID: mặc định "<hostname>-<pid>-<random>", duy nhất mỗi process
@@ -37,10 +37,9 @@ func main() {
 
 	pool := mustPool(ctx)
 	must(saga.Migrate(ctx, pool))        // chạy trên mọi instance được: có advisory lock
-	must(eventbus.Migrate(ctx, pool))
 	eng := mustEngine(pool)
 	must(eng.Start(ctx))
-	must(bus.Start(ctx))
+	must(relay.Start(ctx))       // relay outbox của ứng dụng, nếu có (chương 7)
 	srv := startHTTP()
 
 	<-ctx.Done()
@@ -48,7 +47,8 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdown)   // 1. ngừng nhận request
 	_ = eng.Stop(shutdown)       // 2. chờ run xong; huỷ và bàn giao phần còn lại
-	_ = bus.Stop(shutdown)       // 3. dừng relay và worker
+	_ = events.Stop(shutdown)    // 3. dừng relay
+	_ = consumer.Stop(shutdown)  //    và các handler event
 	pool.Close()
 }
 ```
@@ -57,11 +57,11 @@ func main() {
 
 ## Database
 
-- **Migration:** `saga.Migrate` và `eventbus.Migrate` dùng advisory lock cấp session: chạy qua kết nối trực tiếp (không qua PgBouncer chế độ transaction), với pool ít nhất 3 connection.
+- **Migration:** `saga.Migrate` dùng advisory lock cấp session: chạy qua kết nối trực tiếp (không qua PgBouncer chế độ transaction), với pool ít nhất 3 connection.
 - **Cỡ pool:** mỗi step có hai checkpoint ngắn; định cỡ theo số checkpoint đồng thời, không phải số run đồng thời. Bắt đầu với `max_conns = 10 + số checkpoint đồng thời` và theo dõi thời gian chờ acquire (`pool.Stat().EmptyAcquireCount()`): một checkpoint phải chờ sẽ làm chậm mọi step. Pool thiếu connection còn làm tăng allocation vì mỗi lần chờ tạo một waiter ([benchmarks](../benchmarks.md)). Chi tiết: [Operations](../operations.md#connection-pool-sizing).
 - **PgBouncer:** River cần `LISTEN` và advisory lock; trỏ pool của engine thẳng tới Postgres hoặc dùng session pooling.
 - **Cấu hình pgx:** các checkpoint trên hot path dùng đường ít allocation khi pool ở chế độ mặc định `QueryExecModeCacheStatement` và không có `ConnConfig.Tracer`; có tracer hoặc mode khác thì đi đường pgx thường (vẫn đúng, gấp khoảng đôi allocation). Xem [Operations](../operations.md#hot-path-statements-and-pgx-settings).
-- **Vacuum:** `saga.run`, `saga.step`, `saga.river_job` và `eventbus.outbox` thay đổi liên tục; hạ `autovacuum_vacuum_scale_factor` của chúng (ví dụ 0.01).
+- **Vacuum:** `saga.run`, `saga.step`, `saga.river_job` (và outbox của ứng dụng, nếu có) thay đổi liên tục; hạ `autovacuum_vacuum_scale_factor` của chúng (ví dụ 0.01).
 - **Độ bền và độ trễ:** với `fsync=on` mỗi step tốn một hoặc hai lần flush khi commit; đo storage của bạn (`pg_test_fsync`).
 
 ## Deploy
@@ -70,7 +70,6 @@ func main() {
 - Chỉ đổi chuỗi step bằng version workflow mới, và giữ version cũ cho tới khi các run của nó xong (chương 3).
 - Không đổi tên step đã có dữ liệu ghi; không đổi kiểu output hay dữ liệu compensation một cách không tương thích.
 - Thêm compensator cho step trước đó không có: các step đã ghi trước đó không có dữ liệu compensation và được compensate ở chế độ uncertain (`CompensationUncertain` là true, dữ liệu zero). Viết compensator mới sao cho chạy được chỉ từ key.
-- Subscriber của event bus phải được đăng ký trên mọi instance có relay trước khi event cho chúng được phát.
 
 ## Giám sát
 
@@ -95,11 +94,11 @@ Cảnh báo khi:
 
 | Tín hiệu | Lý do |
 | --- | --- |
-| Có run kết thúc ở `needs_attention` (hoặc event `saga.needs_attention`) | Cần người xử lý |
+| Có run kết thúc ở `needs_attention` | Cần người xử lý |
 | Tỉ lệ step có outcome `retrying` | Một phụ thuộc đang lỗi |
 | p95/p99 thời gian step | Phụ thuộc chậm hoặc chờ pool |
 | Số run `running` có `lease_until < now()` kéo dài quá vài `RecoveryInterval` | Recovery không theo kịp, hoặc không có instance nào đã `Start` |
-| Tuổi của dòng outbox chưa gửi lâu nhất | Lỗi relay hoặc Redis |
+| Tuổi của dòng chưa gửi lâu nhất trong outbox của ứng dụng, nếu có | Lỗi relay hoặc broker |
 | Thời gian chờ acquire của pool | Pool quá nhỏ |
 
 Các truy vấn hữu ích ở [chương 10](10-xu-ly-su-co.md).
@@ -108,7 +107,7 @@ Các truy vấn hữu ích ở [chương 10](10-xu-ly-su-co.md).
 
 - `Options.Retention` xoá các run `done` và `compensated` (cùng step, signal, lock); run `needs_attention` được giữ lại. Đây cũng là thời gian idempotency key được khử trùng lặp.
 - Purge `processed_requests` của các module bằng `idem.Purge` với tuổi **dài hơn**.
-- River tự xoá job đã xong (24 h); event bus xoá dòng outbox đã gửi sau `Retention` của nó (7 ngày).
+- River tự xoá job đã xong (24 h). Outbox của ứng dụng cần retention riêng.
 
 ## Checklist production
 
@@ -117,6 +116,5 @@ Các truy vấn hữu ích ở [chương 10](10-xu-ly-su-co.md).
 - [ ] Module của mọi step khử trùng lặp theo `Key`; compensator chạy được khi uncertain.
 - [ ] Workflow có version; version cũ còn được đăng ký khi còn run của nó.
 - [ ] Đã đặt `Retention`; đã lên lịch `idem.Purge` với tuổi dài hơn.
-- [ ] Có cảnh báo cho `needs_attention`, retry, thời gian chạy, độ trễ recovery, tuổi outbox.
-- [ ] Redis (nếu dùng) với `noeviction` và AOF.
+- [ ] Có cảnh báo cho `needs_attention`, retry, thời gian chạy, độ trễ recovery (và tuổi outbox, nếu có).
 - [ ] Có runbook cho `needs_attention` (chương 4, chương 10).

@@ -95,7 +95,7 @@ Compensator lỗi được retry bền vững:
 saga.WithCompensatePolicy(saga.Exponential(10, time.Second)) // mặc định: 10 lần, bắt đầu từ 1s
 ```
 
-Khi hết policy (hoặc compensator trả `saga.Permanent`), run dừng ở trạng thái `needs_attention`, giữ business lock cho tới hết TTL, và event bus (nếu có) phát event `saga.needs_attention`. Sửa nguyên nhân rồi gọi `eng.RetryCompensation(ctx, runID)` (chương 4).
+Khi hết policy (hoặc compensator trả `saga.Permanent`), run dừng ở trạng thái `needs_attention`, giữ business lock cho tới hết TTL, và các hook khi run kết thúc sẽ thấy trạng thái này (ví dụ để phát cảnh báo, chương 7). Sửa nguyên nhân rồi gọi `eng.RetryCompensation(ctx, runID)` (chương 4).
 
 ## Checklist cho một step
 
