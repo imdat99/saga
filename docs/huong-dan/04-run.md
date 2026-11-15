@@ -85,7 +85,7 @@ needs_attention ──(RetryCompensation)──► compensating
 
 ## Tích hợp HTTP
 
-Một endpoint điển hình với header `Idempotency-Key` (example modulith cài đặt điều này trong `internal/api`):
+Một endpoint điển hình với header `Idempotency-Key`:
 
 ```go
 func (s *Server) postOrder(w http.ResponseWriter, r *http.Request) {

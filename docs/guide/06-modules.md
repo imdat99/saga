@@ -89,7 +89,7 @@ Keep the purge age **longer** than the saga's run retention and longest possible
 
 ## Module boundaries
 
-The example modulith shows a strict layout:
+A strict layout that keeps modules apart:
 
 - each module has its own schema and a `NOLOGIN` role, and runs its transactions with `SET LOCAL ROLE`;
 - modules never import each other; only the `flows` package knows several modules and defines the steps and workflows;

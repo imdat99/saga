@@ -1,7 +1,7 @@
 name: ci
 
 # Pull requests run the full gate. The release workflow calls this one on
-# every push to main and tags a version only if every job here passed.
+# every push to main and tags versions only if every job here passed.
 on:
   pull_request:
   workflow_call:
@@ -20,18 +20,48 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.15.0
-      - name: Release script tests
-        run: bash .github/scripts/next-version_test.sh
+      - name: go.mod is tidy
+        run: go mod tidy -diff
 
-  test:
+  repo:
     runs-on: ubuntu-latest
-    # Integration tests start Postgres 16 and Redis 7 with testcontainers;
-    # the hosted runner has Docker.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Release script tests
+        run: bash .github/scripts/next-version_test.sh
+      - name: Direct dependencies are the allowed ones
+        # Go modules have no test-only dependencies: anything this module
+        # imports (tests included) lands in the module graph of every user.
+        # Adding one is a design decision: update this list and the decision
+        # log (docs/PLAN.md). No broker or event library: applications plug
+        # theirs in through RunHook.
+        run: |
+          allowed='github.com/google/uuid
+          github.com/jackc/pgx/v5
+          github.com/pressly/goose/v3
+          github.com/riverqueue/river
+          github.com/riverqueue/river/riverdriver/riverpgxv5'
+          extra=$(go mod edit -json | jq -r '.Require[] | select(.Indirect | not) | .Path' \
+            | grep -vxF -f <(sed 's/^ *//' <<<"$allowed") || true)
+          if [ -n "$extra" ]; then
+            echo "::error::direct dependencies not in the allowlist: $extra"
+            exit 1
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    # Integration tests use the Postgres 16 of docker-compose.yml (the same as
+    # `make up`), shared by every package.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Start Postgres
+        run: docker compose up -d --wait
       - name: Unit and integration tests
         run: go test -race -count=1 ./...
       - name: Chaos tests
@@ -39,7 +69,7 @@ jobs:
 
   perf:
     runs-on: ubuntu-latest
-    # Benchmarks against the testcontainers Postgres, checked against
+    # Engine benchmarks against the docker compose Postgres, checked against
     # .github/perf-budget.txt (medians of 5 runs). Commit cost is excluded
     # (SAGA_BENCH_ASYNC_COMMIT): the gate measures the engine, not the disk.
     env:
@@ -50,6 +80,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Start Postgres
+        run: docker compose up -d --wait
       - name: Benchmarks
         shell: bash # -o pipefail: a failing benchmark must fail the step despite tee
         run: go test -run '^$' -bench . -benchtime 500x -count 5 . | tee bench.txt

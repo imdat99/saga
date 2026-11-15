@@ -1,6 +1,6 @@
 # saga - agent guide
 
-Saga orchestrator library for Go modular monoliths that run as several instances. Postgres is the source of truth; River (Postgres queue) drives saga timers, retries and resumes; events are delivered through a Postgres outbox to BullMQ (Redis) using the owner's port `github.com/imdat99/bullmq`.
+Saga orchestrator library for Go modular monoliths that run as several instances. Postgres is the source of truth; River (Postgres queue) drives saga timers, retries and resumes. Event delivery is not part of this repository: applications plug their own outbox and broker (Kafka, BullMQ, ...) in through `RunHook`; the engine knows no broker.
 
 ## Start here
 
@@ -19,11 +19,12 @@ Saga orchestrator library for Go modular monoliths that run as several instances
 ## Commands
 
 ```bash
-make test                      # go test -race -count=1 ./... (Docker needed: testcontainers starts Postgres 16)
+make up / make down            # docker compose Postgres: the tests need it (make up first)
+make test                      # go test -race -count=1 ./...
 go test -race -count=10 .      # flakiness check before ticking a milestone
 make test-chaos                # chaos tests (build tag chaos), from M2 on
-make up / make down            # docker compose Postgres + Redis for manual runs
-SAGA_TEST_DSN=postgres://saga:saga@localhost:5432/saga?sslmode=disable make test   # reuse compose Postgres
+make lint
+SAGA_TEST_DSN=postgres://... make test   # another server
 ```
 
 ## Architecture invariants (do not break)
@@ -33,7 +34,7 @@ SAGA_TEST_DSN=postgres://saga:saga@localhost:5432/saga?sslmode=disable make test
 - **Idempotency:** steps run at least once; the step `Key` (`runID:seq:name`) is stable across re-executions and is the module's dedup key. Compensators are at-least-once and idempotent.
 - **Replay:** workflow functions are re-executed on resume; recorded steps return stored outputs; a different step at the same position is non-determinism and parks the run as `needs_attention`.
 - **Compensation by name:** compensators are looked up in the registry by step name with persisted `comp_data`, so recovery never needs the workflow function.
-- **Same-transaction enqueue:** any River job that continues a run (resume, retry, timer) must be inserted in the same transaction as the checkpoint that requires it (`InsertTx`). No dual writes between Postgres and Redis: events go to the outbox first, the relay pushes to BullMQ.
+- **Same-transaction enqueue:** any River job that continues a run (resume, retry, timer) must be inserted in the same transaction as the checkpoint that requires it (`InsertTx`). No dual writes: whatever must happen with a checkpoint commits in its transaction (e.g. `RunHook` in the terminal one).
 - **Time:** leases and timers use Postgres `now()`, never the instance clock.
 - **Small checkpoints:** outputs and `comp_data` hold IDs, not entities.
 
@@ -41,6 +42,8 @@ SAGA_TEST_DSN=postgres://saga:saga@localhost:5432/saga?sslmode=disable make test
 
 - Go 1.27, `pgx/v5` (no `database/sql` except for goose), goose migrations embedded in `migrations/` (new file per change, never edit an applied migration), River for jobs.
 - Public API in the root package `saga`; storage and internals under `internal/`.
+- Direct dependencies are an allowlist (CI `deps` check in `.github/workflows/ci.yml`): pgx, goose, River, uuid. Adding one is a design decision (decision log): Go modules have no test-only dependencies, so any import, tests included, reaches every user's module graph (that is why there is no testcontainers). No broker or event library: event delivery belongs to applications, through `RunHook` (guide chapter 7).
+- `RunHook`, `RunInfo` and `RunIDFrom` are public extension points that applications build outboxes on: treat changes to them as breaking.
 - Errors: wrap with `%w` and context; exported sentinels in `errors.go`.
 - Tests are integration tests against real Postgres via `internal/testdb` (`testdb.New(t)` gives a fresh database per test). Name steps/workflows defined in tests with `testdb.UniqueName(t, ...)`: the registry is global and rejects duplicates.
 - No emojis.

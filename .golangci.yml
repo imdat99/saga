@@ -67,47 +67,18 @@ linters:
         # The library core must not depend on its optional add-ons or on apps.
         core:
           files:
-            - "!**/eventbus/**"
             - "!**/idem/**"
             - "!**/examples/**"
             - "!**/test/**"
             - "!$test"
             - "!**/migrate.go"
           deny:
-            - pkg: github.com/imdat99/saga/eventbus
-              desc: the saga core exposes hooks; eventbus plugs into them, not the reverse
             - pkg: github.com/imdat99/saga/idem
               desc: idem is a module-side helper, the core must not need it
             - pkg: github.com/imdat99/saga/examples
               desc: the library must not import example code
             - pkg: database/sql
               desc: use pgx/v5 (database/sql only inside Migrate for goose)
-        # Modules of the example modulith are isolated: they talk through
-        # flows (sagas) and events, never by importing each other.
-        module-inventory:
-          files:
-            - "**/examples/modulith/internal/modules/inventory/**"
-          deny:
-            - pkg: github.com/imdat99/saga/examples/modulith/internal/modules/payment
-              desc: modules must not import each other
-            - pkg: github.com/imdat99/saga/examples/modulith/internal/modules/order
-              desc: modules must not import each other
-        module-payment:
-          files:
-            - "**/examples/modulith/internal/modules/payment/**"
-          deny:
-            - pkg: github.com/imdat99/saga/examples/modulith/internal/modules/inventory
-              desc: modules must not import each other
-            - pkg: github.com/imdat99/saga/examples/modulith/internal/modules/order
-              desc: modules must not import each other
-        module-order:
-          files:
-            - "**/examples/modulith/internal/modules/order/**"
-          deny:
-            - pkg: github.com/imdat99/saga/examples/modulith/internal/modules/inventory
-              desc: modules must not import each other
-            - pkg: github.com/imdat99/saga/examples/modulith/internal/modules/payment
-              desc: modules must not import each other
     errcheck:
       check-type-assertions: true
     gocyclo:

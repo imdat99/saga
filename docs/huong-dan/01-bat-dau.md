@@ -4,11 +4,10 @@
 
 - Go 1.27 trở lên.
 - Postgres (repository chỉ được kiểm thử trên bản 16). Engine lưu mọi thứ ở đây: run, step, signal, lock và hàng đợi job (River).
-- Redis 7, chỉ khi dùng event bus (chương 7).
 
 ```bash
 go get github.com/imdat99/saga@latest   # các bản release có tag: vX.Y.Z
-make up   # trong repository này: Postgres 16 và Redis 7 từ docker-compose.yml
+make up   # trong repository này: Postgres 16 từ docker-compose.yml
 ```
 
 ## Mô hình trong một đoạn

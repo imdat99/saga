@@ -43,7 +43,7 @@ type Options struct {
 	// after its context is done. Defaults to 5s.
 	ShutdownGrace time.Duration
 	// Hooks run inside the transaction that ends a run (see RunHook), in
-	// order. The event bus is one.
+	// order, e.g. a transactional outbox releasing the events a run staged.
 	Hooks []RunHook
 	// AsyncStepStart commits the "started" checkpoint of each step without
 	// waiting for the WAL flush (synchronous_commit=off for that statement

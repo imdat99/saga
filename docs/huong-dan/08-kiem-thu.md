@@ -2,13 +2,14 @@
 
 Saga nên được kiểm thử với Postgres thật: các đảm bảo nằm ở SQL (lock, fencing, unique key), một bản giả trong bộ nhớ sẽ kiểm thử thứ khác. Mỗi test một database giúp các test độc lập mà vẫn đủ nhanh.
 
-## Mỗi test binary một Postgres, mỗi test một database
+## Một Postgres dùng chung, mỗi test một database
 
 `internal/testdb` của repository là mẫu tốt để sao chép:
 
-- một container cho mỗi test binary (testcontainers, `postgres:16-alpine`), hoặc một server có sẵn qua biến môi trường (`SAGA_TEST_DSN`);
-- `New(t)` tạo database mới, trả về pool, và xoá database khi test kết thúc;
-- container chạy `fsync=off` cho nhanh (đừng đo độ bền ở đó).
+- một server Postgres dùng chung cho mọi test binary: mặc định là server của docker compose (`make up`), hoặc server khác qua biến môi trường (`SAGA_TEST_DSN`);
+- `New(t)` tạo database mới (đặt tên theo process id và một bộ đếm, nên các test binary chạy song song không đụng nhau), trả về pool, và xoá database khi test kết thúc.
+
+Trong một ứng dụng, khởi động server ngay từ test bằng [testcontainers-go](https://golang.testcontainers.org/) là lựa chọn tốt (mỗi test binary một container, không phải bật tay). Repository này không làm vậy vì nó là thư viện: Go module không có phụ thuộc chỉ dành cho test, nên testcontainers sẽ nằm trong đồ thị module của mọi người dùng saga.
 
 ```go
 func setup(t *testing.T) (*pgxpool.Pool, *saga.Engine) {
@@ -69,7 +70,7 @@ if !errors.As(err, &re) || re.Status != saga.StatusCompensated {
 
 ### Retry
 
-Cho module lỗi tạm thời N lần (service payment trong modulith có `FailNext(n)`), chạy, rồi chờ kết quả. Retry làm run bị park, nên dùng handle và cho đủ thời gian (backoff làm tròn lên khoảng 5 s):
+Cho module lỗi tạm thời N lần (ví dụ một payment provider giả có method `FailNext(n)`), chạy, rồi chờ kết quả. Retry làm run bị park, nên dùng handle và cho đủ thời gian (backoff làm tròn lên khoảng 5 s):
 
 ```go
 out, err := wf.Run(ctx, eng, key, in)
@@ -118,8 +119,8 @@ Với timeout của `Sleep` và `Await`, giữ thời lượng ngắn trong test
 ## Chạy test
 
 ```bash
-go test -race ./...                 # cần Docker cho testcontainers
-SAGA_TEST_DSN=postgres://... go test ./...   # dùng lại Postgres đang chạy (mỗi test vẫn có database riêng)
+make up && go test -race ./...      # Postgres của docker compose
+SAGA_TEST_DSN=postgres://... go test ./...   # server khác (mỗi test vẫn có database riêng)
 go test -race -count=10 ./...       # kiểm tra test chập chờn trước khi merge
 ```
 

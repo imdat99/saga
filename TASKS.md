@@ -13,18 +13,19 @@ Legend: `[x]` done, `[~]` in progress, `[ ]` todo. Update this file in the same 
 | M2 | Lease heartbeat, recovery, multi-instance | Done |
 | M3 | Retry, Sleep, Await/Signal, timeouts, durable compensation | Done |
 | M4 | Business locks, `idem` helper | Done |
-| M5 | Event bus: staging, outbox, relay to BullMQ | Done |
-| M6 | Example modulith, e2e, benchmarks, observability | Done |
+| M5 | Event bus: staging, outbox, relay to BullMQ | Done (moved to github.com/imdat99/eventbus on 2026-11-15) |
+| M6 | Example modulith, e2e, benchmarks, observability | Done (modulith removed on 2026-11-15) |
 | M7 | GC and allocation diet of the hot path | Done |
 | M8 | Allocation diet, second pass | Done |
+| M9 | Event bus for several services: consumer groups, Redis registry, producer/consumer split | Done (moved to github.com/imdat99/eventbus on 2026-11-15) |
 
 ## M0 - Skeleton
 
-- [x] `go.mod` (`github.com/imdat99/saga`), pgx/v5, goose, uuid, testcontainers
-- [x] `docker-compose.yml`: Postgres 16, Redis 7 (`noeviction`, AOF)
+- [x] `go.mod` (`github.com/imdat99/saga`), pgx/v5, goose, uuid (testcontainers until the module split)
+- [x] `docker-compose.yml`: Postgres 16 (Redis 7 until the event bus moved out)
 - [x] `Makefile`: `up`, `down`, `test`, `test-chaos`, `lint`
 - [x] goose migrations embedded (`migrations/`), `saga.Migrate` with session lock
-- [x] `internal/testdb`: one container per test binary, one database per test, `SAGA_TEST_DSN` override
+- [x] `internal/testdb`: one database per test, `SAGA_TEST_DSN` override (one container per test binary until the module split, now the shared compose server)
 - [x] `.golangci.yml` with depguard rules (core must not import add-ons; example modules must not import each other)
 - [x] CI workflow (lint + `go test -race`, chaos tag)
 
@@ -80,6 +81,8 @@ Legend: `[x]` done, `[~]` in progress, `[ ]` todo. Update this file in the same 
 
 ## M5 - Event bus
 
+History: the event bus now lives in github.com/imdat99/eventbus; this repository keeps only `saga.RunHook`.
+
 - [x] Tables `eventbus.staging`, `eventbus.outbox` (own goose migrations, schema `eventbus`, `eventbus.Migrate`)
 - [x] `Bus.EmitTx(ctx, tx, events...)`: staging when inside a run (`saga.RunIDFrom`), outbox otherwise; UUIDv7 event ids
 - [x] Move staging to outbox in the same tx as `status = done`; delete staging on `compensated`/`needs_attention`, via the new core `saga.RunHook` (`Options.Hooks`) so the core does not import eventbus
@@ -91,6 +94,8 @@ Legend: `[x]` done, `[~]` in progress, `[ ]` todo. Update this file in the same 
 - [x] Review fixes: immutable running snapshot (no `Stop` deadlock with an in-flight pass), queue per subscriber by default and `Start` rejects partly handled queues, retention only drops staging of ended runs and keeps up under load (own loop, batches until caught up, SKIP LOCKED), `RunEnded` in one statement, batched `EmitTx`, nested runs do not inherit the parent's run id
 
 ## M6 - Example modulith and hardening
+
+History: `examples/modulith` was removed on 2026-11-15 (it depended on the event bus); the rest of this milestone stays.
 
 - [x] `examples/modulith`: modules inventory, payment (fake provider with idempotency), order; own schema and NOLOGIN role each (`SET LOCAL ROLE` per module transaction), depguard keeps modules apart
 - [x] Flow `order.complete` with cart lock, reservation, payment authorize (retry + timeout), order create emitting `order.created`; uncertain compensation through `idem.Abort`
@@ -122,6 +127,24 @@ Start: 69 allocs/op (`BenchmarkStepRun`). Breakdown per run: ~21 pgconn command 
 - [x] Round 6 - encode through a pointer when the type provably encodes the same (no pointer-receiver marshal method on the value or on anything reached through struct fields and arrays), uuid v7 without the reader allocation. 52 -> 40. Review: PASS (byte equality checked against the json/v2 source; extra cases tested: pointer root, omitzero with pointer `IsZero`, pointer `MarshalText` map keys)
 - [x] Verified: benchmarks (interleaved benchstat vs M7: 69 -> 40 allocs/op, -8.5% B/op, latency unchanged), full suite, `-count=10 . ./internal/store`, chaos, lint; one review per round focused on invariants (3 rounds, all PASS on the first review)
 
+## M9 - Event bus for several services
+
+History: moved to github.com/imdat99/eventbus on 2026-11-15.
+
+Bug (found by the user, reproduced by `TestSubscriberInAnotherService`: 20 of 40 deliveries lost): a relay fanned events out only to the subscribers registered in its own process, so a subscriber of another service (or another instance with a different subscriber set) missed every event relayed elsewhere, and a service could not subscribe without a Postgres pool (every Bus ran the relay). Tests only ever ran publisher and subscribers in one Bus. Design after reading Medusa's event-bus-redis (one queue, job per event, worker runs all local subscribers, completedSubscriberIds on retry, server/worker modes), keeping our transactional outbox and staging.
+
+- [x] Consumer groups: one BullMQ queue per group (a service), one job per (event, group), job id `<eventID>.<group>`; the group's workers run every local handler of the event, recording completed subscribers in the job data so a retry skips them (Medusa); a handler returning `Unrecoverable` is given up without failing the others
+- [x] Registry in Redis: `routes` (event -> groups, union across the group's instances) and `groups` (retry policy), with a version counter so relays reload only on change; `Unregister(group)`, `Forget(group, event)`
+- [x] Split: `NewProducer(pool, opts)` (EmitTx, RunEnded, relay, retention) and the leaf package `eventbus/consume` (Consumer, Event, Subscriber; depends on bullmq only, no Postgres/saga/River), aliased from `eventbus`; `Bus` removed (breaking, `feat!`)
+- [x] Rolling deploy: an event routed to the group but without a local handler on this instance fails retryably (another instance takes the retry)
+- [x] Performance: each event encoded once per pass (JSON built by Postgres, shared by every group's job), job options precomputed per group, one options slice per pass; relay and consumer benchmarks with allocation budgets in CI
+- [x] Tests written first: two services both receive every event with two relaying producers, consumer without Postgres, partial retry, rolling deploy, unrecoverable handler, registry change picked up, unregister/forget, plus the existing lifecycle, crash-after-push and saga tests ported
+- [x] Docs: guide chapter 7 (both languages), operations, README, decision log, known limitations; modulith example ported
+- [~] Review round 1: FAIL (EmitTx bytea in PgBouncer modes, handler panic, given-up handlers completing, empty-registry drops, hand-off bound, consumer deps, sequential group push, unbounded scratch); all fixed with tests (query modes, panic, failed set, held events, registry loss, deterministic hand-off with Attempts=1, mutation-checked)
+- [x] Review round 2: FAIL (addAll could return with pushes in flight reading the reused arena; forgotten routes cycling every 500ms; registry loss with several groups; scratch references kept); fixed: queues resolved before any push, age-based hand-off delay, registry epoch + sticky routes for RegistryGrace, scratch cleared; tests for each (mutation-checked)
+- [x] Review round 3: PASS (two residual windows after Redis data loss documented as known limitations with a recovery procedure)
+- [x] Verified: full suite with race, `-count=10 ./eventbus/...`, chaos, golangci-lint, actionlint, benchmarks within the CI budget (relay 10448 allocs/pass for 2 groups, 5335 for one group with 2 handlers, EmitTx 12, consume 2)
+
 ## Docs - User guide
 
 - [x] Bilingual user guide: `docs/guide` (English, primary) and `docs/huong-dan` (Vietnamese, same structure): getting started, steps, workflows, runs, waiting, modules (`idem`), event bus, testing, production, troubleshooting
@@ -136,6 +159,13 @@ Start: 69 allocs/op (`BenchmarkStepRun`). Breakdown per run: ~21 pgconn command 
 - [x] `ci.yml` (pull requests, and called by `release.yml`): lint + release script tests, `-race` tests, chaos tests, performance budget (`internal/tools/benchgate` against `.github/perf-budget.txt`, medians of 5 runs, report in the job summary, `bench.txt` artifact)
 - [x] `release.yml` (push to `main`): the whole CI gate, then the next semver tag from Conventional Commits (`.github/scripts/next-version.sh`, tested by `next-version_test.sh`), GitHub release with generated notes, Go proxy notified; serialized with a concurrency group
 - [x] Validated locally: actionlint clean, benchgate unit tests, version script tests (9 cases), budget passes on the CI benchmark command (StepRun 40 allocs/op, 3.4 KiB/op, p95 2.4 ms; 3 instances 56 allocs/op, 204 runs/s)
+- [x] Event bus out of this repository (2026-11-15): first a nested module, then moved by the user to `github.com/imdat99/eventbus` (own CI, release, perf budget, test helpers); `eventbus/`, `examples/modulith/` and `internal/testredis` removed here. Guide chapter 7 rewritten as "Events and run-end hooks" (the `RunHook` outbox pattern, compiled against the API), operations/production/concepts/guarantees no longer describe the event bus. Engine `go.mod` down to pgx, goose, River, uuid
+- [x] testcontainers removed: `internal/testdb` uses the docker compose Postgres (`make up`) or `SAGA_TEST_DSN`; compose Postgres only (`max_connections=500`); CI starts it with `docker compose up -d --wait`
+- [x] CI: direct dependencies checked against an allowlist (pgx, goose, River, uuid; no broker, no testcontainers), `go mod tidy -diff` (the release workflow is unchanged: one module, one tag)
+- [x] Guide chapter 7 is broker-agnostic ("Choosing the broker"): no reference to a specific event library
+- [x] Guide chapter 12 "Integrating an event bus" (both languages): engine contract (`RunHook` called in the terminal transaction, twice for needs_attention then compensated; `RunIDFrom` true in steps, false in compensators, child id in child runs), schema, `Emit`, hook, relay (`SKIP LOCKED`, ordering, poison events), broker table (Kafka, JetStream, RabbitMQ, Redis), consumers, operations, tests, checklist
+- [x] `examples/outbox`: the chapter's code as a package with integration tests (done releases, compensated drops but compensator events go out, re-executed step stages once, needs_attention keeps + alerts then RetryCompensation drops, failing broker, two relays publish each event once, monitoring queries); the chapters' code blocks are checked identical to it
+- [x] Verified: `go test -race`, chaos, golangci-lint, budget passes on the CI benchmark command
 - [ ] First run on GitHub (needs the push): check the runner's p95 and the three-instance allocations against the budget, adjust with a reason if the hosted runner differs
 
 ## Known limitations (current)
@@ -155,9 +185,6 @@ Start: 69 allocs/op (`BenchmarkStepRun`). Breakdown per run: ~21 pgconn command 
 - Locks are polled, not queued (no fairness, no deadlock detection): take several locks in a fixed order.
 - `idem.Do` under REPEATABLE READ/SERIALIZABLE turns a concurrent duplicate into a serialization error (40001): callers retry.
 - The allocation fast path of hot-path statements (M7) is off when the pool has a pgx tracer (e.g. OpenTelemetry) or a query mode other than `QueryExecModeCacheStatement`: those pools use the regular pgx path, about twice the allocations per step. On the fast path a custom pgconn `BuildContextWatcherHandler` is not used: cancellation interrupts the statement with a connection deadline (pgconn's default behaviour).
-- Every instance relaying must register the same subscribers: a relay that does not know a subscriber skips it for the events it relays (rolling deploy adding a subscriber).
-- The relay holds its outbox rows locked while it calls Redis (bounded batch): a slow Redis slows the relay, it does not lose events. An event that can never be pushed blocks its batch (no quarantine).
-- A `RunHook` that keeps failing (e.g. eventbus schema not migrated) makes the run's terminal transition fail on every resume; the run is never parked.
-- `eventbus.Unrecoverable` keeps only the error message (BullMQ API).
-- One BullMQ queue per subscriber by default: each handled subscriber costs a worker (blocking Redis connection, up to `Concurrency` goroutines), and each relay pass makes about two Redis round trips per subscriber queue, sequentially.
+- Tests need `make up` (or `SAGA_TEST_DSN`) first: they no longer start their own servers. The compose Postgres has `fsync` on, so the suite is slower than on the old containers (root package ~50 s -> ~70 s).
+- A `RunHook` that keeps failing (e.g. its tables not migrated) makes the run's terminal transition fail on every resume; the run is never parked.
 - Each step costs 2 round trips and 2 durable commits (1 durable + 1 async with `AsyncStepStart`); retries, parking and compensation still use multi-statement fenced transactions.

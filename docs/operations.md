@@ -79,33 +79,16 @@ Hot tables for autovacuum tuning: `saga.step`, `saga.run`, `saga.river_job`.
 
 Every lease renewal updates `saga.run.lease_until`, an indexed column, so it is not a HOT update: each active run adds one index entry to `run_recoverable_idx` every `LeaseTTL/3`. With many long-running runs, tune autovacuum on `saga.run` accordingly (or raise `LeaseTTL`).
 
-## Event bus
+## Run-end hooks
 
-```go
-bus := eventbus.New(pool, eventbus.Options{Redis: bullmq.RedisConnectionOptions{URL: redisURL}})
-bus.Subscribe(eventbus.Subscriber{ID: "billing.invoice", Event: "order.created", Handle: onOrderCreated})
-eng, _ := saga.New(pool, saga.Options{Hooks: []saga.RunHook{bus}})
-_ = eventbus.Migrate(ctx, pool)
-_ = bus.Start(ctx)
-defer bus.Stop(shutdownCtx)
-```
-
-- Redis must run with `maxmemory-policy noeviction` and AOF; watch its memory. Losing Redis delays delivery of events still in the outbox; it does not lose them. Events already pushed (rows marked sent) and not yet processed live only in Redis: with `appendfsync everysec` up to one second of them can be lost in a Redis crash, use `appendfsync always` if that matters.
-- Every instance runs the relay; batches use `SKIP LOCKED`. Register the same subscribers on every instance, or events relayed by an instance that lacks one skip it.
-- Each subscriber gets its own BullMQ queue by default. If you group subscribers on one `Queue`, every instance with a handler for one of them needs handlers for all (`Start` refuses otherwise): a worker that takes a job it cannot handle wastes an attempt.
-- A subscriber registered without a handler on any instance accumulates jobs in Redis forever: remove it from every instance (or drain its queue) when retiring it.
-- One event that cannot be pushed (e.g. Redis OOM) blocks the relay for the whole batch it is in, on every instance, until it can.
-- Delivery is at least once and unordered: handlers deduplicate by `Event.ID` and re-read state.
-- Failed jobs stay 7 days in BullMQ's failed set (dead letter queue); completed jobs 24h, which is also the window in which a re-pushed job id is ignored.
-- Sent outbox rows, and staging rows of runs that already ended, are deleted after `Retention` (7 days) by a retention loop every `CleanupInterval` (1 minute), in batches of 5000 until caught up.
+`Options.Hooks` run inside the transaction that ends each run, under its lease and row lock: their cost adds to every run's last checkpoint, and a hook that fails rolls the transition back (the run is retried later, the hook called again). Keep them to a few indexed statements, never network calls. An application outbox fed by a hook needs its own relay, retention and monitoring (age of the oldest unsent row): see [guide chapter 12](guide/12-event-integration.md#operating-it).
 
 ## Retention and vacuum
 
 - `saga.Options{Retention: 30 * 24 * time.Hour}` purges done and compensated runs (the River leader enqueues the job, any instance runs it, on its own queue) (steps, signals and locks cascade) every `RetentionInterval` (1h), in batches of 1000. `needs_attention` runs are kept. `Engine.PurgeRuns` does the same on demand. Retention is also the deduplication window of idempotency keys: after it, the same key starts a new run. Purge the modules' `processed_requests` (`idem.Purge`) with a longer age.
 - River deletes its own completed jobs (24h by default).
-- `eventbus` deletes sent outbox rows after `Retention` (7 days).
-- Hot tables: `saga.run` (lease renewals are non-HOT updates of an indexed column), `saga.step` (one insert and one or two updates per step), `saga.river_job`, `eventbus.outbox`. Lower their `autovacuum_vacuum_scale_factor` (e.g. 0.01) so vacuum keeps up with the churn instead of waiting for 20% dead tuples.
+- Hot tables: `saga.run` (lease renewals are non-HOT updates of an indexed column), `saga.step` (one insert and one or two updates per step), `saga.river_job` (and an application outbox, if any). Lower their `autovacuum_vacuum_scale_factor` (e.g. 0.01) so vacuum keeps up with the churn instead of waiting for 20% dead tuples.
 
 ## Metrics
 
-Implement `saga.Observer` to export step attempts (outcome, duration) and runs ended (by status); the example modulith publishes them with `expvar` at `/debug/vars`. Useful alerts: runs ending `needs_attention` (also an event), step `retrying` rate, step duration percentiles, and the age of the oldest unsent outbox row.
+Implement `saga.Observer` to export step attempts (outcome, duration) and runs ended (by status); e.g. publish them with `expvar` at `/debug/vars` or as Prometheus metrics. Useful alerts: runs ending `needs_attention`, step `retrying` rate, step duration percentiles, and the age of the oldest unsent row of an application outbox, if any.

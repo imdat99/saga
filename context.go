@@ -241,7 +241,7 @@ func stepKey(runID string, seq int, name string) Key {
 }
 
 // RunIDFrom returns the id of the saga run ctx belongs to, if any. Modules use
-// it (e.g. the event bus) to tell whether they are called from a saga step.
+// it (e.g. an event outbox) to tell whether they are called from a saga step.
 func RunIDFrom(ctx context.Context) (string, bool) {
 	c, ok := ctx.Value(runCtxKey{}).(*runCtx)
 	if !ok || c == nil {

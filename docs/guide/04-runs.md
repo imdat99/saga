@@ -85,7 +85,7 @@ needs_attention ──(RetryCompensation)──► compensating
 
 ## HTTP integration
 
-A typical endpoint with an `Idempotency-Key` header (the example modulith implements this in `internal/api`):
+A typical endpoint with an `Idempotency-Key` header:
 
 ```go
 func (s *Server) postOrder(w http.ResponseWriter, r *http.Request) {

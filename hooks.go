@@ -21,7 +21,8 @@ type RunInfo struct {
 // that records a terminal status (done, compensated, needs_attention), under
 // the run's lease, so whatever it writes commits atomically with the status;
 // returning an error rolls the transition back (the run is retried later).
-// The event bus uses it to release or drop the events a run staged.
+// A transactional outbox can use it to release (done) or drop (compensated)
+// the events a run staged, so that a rolled-back run publishes nothing.
 //
 // It runs on the engine's hot path: keep it to a few statements.
 type RunHook interface {

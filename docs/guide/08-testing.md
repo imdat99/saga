@@ -2,13 +2,14 @@
 
 Sagas are best tested against a real Postgres: the guarantees live in SQL (locks, fencing, unique keys), and an in-memory fake would test something else. A test database per test keeps tests independent and fast enough.
 
-## A Postgres per test binary, a database per test
+## A shared Postgres, a database per test
 
 This repository's `internal/testdb` is a good template to copy:
 
-- one container per test binary (testcontainers, `postgres:16-alpine`), or an existing server from an environment variable (`SAGA_TEST_DSN`);
-- `New(t)` creates a fresh database, returns a pool, and drops the database when the test ends;
-- `fsync=off` in the container for speed (do not benchmark durability there).
+- one Postgres server shared by every test binary: the docker compose one by default (`make up`), or another from an environment variable (`SAGA_TEST_DSN`);
+- `New(t)` creates a fresh database (named after the process id and a counter, so parallel test binaries do not collide), returns a pool, and drops the database when the test ends.
+
+In an application, starting the server from the tests with [testcontainers-go](https://golang.testcontainers.org/) is a fine alternative (one container per test binary, nothing to start by hand). This repository does not, because it is a library: Go modules have no test-only dependencies, so testcontainers would land in the module graph of every user of saga.
 
 ```go
 func setup(t *testing.T) (*pgxpool.Pool, *saga.Engine) {
@@ -69,7 +70,7 @@ if !errors.As(err, &re) || re.Status != saga.StatusCompensated {
 
 ### Retries
 
-Make the module fail transiently N times (the modulith's payment service has `FailNext(n)`), run, and wait for the outcome. Retries park the run, so use the handle and give it time (backoffs round up to about 5 s):
+Make the module fail transiently N times (e.g. a fake payment provider with a `FailNext(n)` method), run, and wait for the outcome. Retries park the run, so use the handle and give it time (backoffs round up to about 5 s):
 
 ```go
 out, err := wf.Run(ctx, eng, key, in)
@@ -118,8 +119,8 @@ For `Sleep` and `Await` timeouts, keep durations short in tests and allow about 
 ## Running
 
 ```bash
-go test -race ./...                 # Docker required for testcontainers
-SAGA_TEST_DSN=postgres://... go test ./...   # reuse a running Postgres (each test still gets its own database)
+make up && go test -race ./...      # Postgres from docker compose
+SAGA_TEST_DSN=postgres://... go test ./...   # another server (each test still gets its own database)
 go test -race -count=10 ./...       # flakiness check before merging
 ```
 

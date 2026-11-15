@@ -20,13 +20,14 @@ Các tài liệu tham chiếu (tiếng Anh) giữ ngắn gọn và chính xác; 
 4. [Khởi chạy và theo dõi run](04-run.md): idempotency key, `Run`, `Start`, `Lookup`, `Handle`, các kết quả, tích hợp HTTP, khôi phục thủ công.
 5. [Chờ đợi: Sleep, Await, signal, lock](05-cho-doi.md): park, `Sleep`, `Await`, `Signal`, `SignalKey`, `Lock`.
 6. [Viết module với `idem`](06-module.md): hiệu ứng đúng một lần, compensator hoạt động cả khi không chắc chắn.
-7. [Event bus](07-su-kien.md): phát event từ step, subscriber, ngữ nghĩa giao nhận, event `needs_attention`.
+7. [Event và hook khi run kết thúc](07-su-kien.md): vì sao không phát event từ step, giữ event lại và thả bằng `RunHook`.
 8. [Kiểm thử](08-kiem-thu.md): integration test, giả lập lỗi, crash và resume, tính tất định.
 9. [Triển khai production](09-production.md): cấu hình, định cỡ, shutdown, deploy, giám sát, retention.
 10. [Xử lý sự cố](10-xu-ly-su-co.md): triệu chứng, nguyên nhân, cách sửa, và SQL để kiểm tra run.
 11. [Tầng API hay worker](11-api-hay-worker.md): run thực thi ở đâu, `Run` inline hay `Start` qua hàng đợi, cách kết hợp, tách vai trò API và worker.
+12. [Tích hợp event bus](12-tich-hop-event-bus.md): cam kết của engine (`RunHook`, `RunIDFrom`), bảng staging và outbox, hook, relay sang broker bất kỳ (Kafka, NATS, RabbitMQ, Redis), consumer, vận hành, kiểm thử.
 
-Chương trình của chương 1 nằm ở [examples/quickstart](../../examples/quickstart/main.go); một ứng dụng đầy đủ với ba module tách biệt, HTTP API và nhiều instance nằm ở [examples/modulith](../../examples/modulith).
+Chương trình của chương 1 nằm ở [examples/quickstart](../../examples/quickstart/main.go); [examples/longrunning](../../examples/longrunning) và [examples/multiworkflow](../../examples/multiworkflow) minh hoạ chờ đợi (signal, timer) và workflow cha/con.
 
 ## Thuật ngữ
 

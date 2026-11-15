@@ -44,4 +44,4 @@ Compensators are found by step name, so recovery can compensate without the work
 
 ## Events
 
-Modules emit events with `eventbus.Bus.EmitTx` in their own transaction. From inside a step, events are staged and only published (moved to the outbox) in the transaction that marks the run `done`; a compensated run publishes nothing. The relay pushes the outbox to BullMQ, one job per subscriber, deduplicated by job id.
+The engine does not deliver events. It calls `RunHook.RunEnded` inside the transaction that records a run's terminal status, so an application can stage events in its steps and release them only when the run is `done` (a compensated run publishes nothing), through its own outbox ([guide chapters 7](guide/07-events.md) and [12](guide/12-event-integration.md)). The broker (Kafka, NATS, RabbitMQ, Redis...) is the application's choice; the engine knows none.
